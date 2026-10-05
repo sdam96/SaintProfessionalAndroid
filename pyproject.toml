@@ -1,0 +1,33 @@
+[project]
+name = "saintprofessionalandroid"
+version = "1.0.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "flet==1.0.0",
+    "httpx"
+]
+
+[tool.flet]
+product = "Saint Professional Facturación"
+org = "com.saintnet"
+bundle_id = "com.saintnet.saintprofessionalandroid"
+company = "Saintnet Latinoamérica, inc"
+copyright = "Copyright (c) 2026. Saintnet Latinoamérica, inc"
+build_number = 1
+icon_background = "#1a1a2e"
+permissions = []
+target_arch = ["arm64-v8a"]
+
+[tool.flet.android]
+artifact = "Saint Professional Facturación"
+org = "com.saintnet"
+bundle_id = "com.saintnet.saintprofessionalandroid"
+
+[tool.flet.android.app]
+exclude = [".git", ".venv"]
+
+[tool.flet.android.permission]
+"android.permission.INTERNET" = true
+
+[tool.flet.android.manifest_application]
+usesCleartextTraffic = "true"
