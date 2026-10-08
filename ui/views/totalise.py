@@ -1,4 +1,9 @@
-"""Document conditions, breakdown and payment instruments."""
+"""Payment details: document conditions, breakdown and payment instruments.
+
+The five instruments are the five slots of Saint's payment window and keep
+its names. They are not all shown up front: the user adds the ones the
+customer pays with, each at most once, and can remove them again.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +18,11 @@ from api_client import ApiError
 from models import PaymentSlot
 
 from ..context import AppContext
-from ..theme import (ACCENT, BACKGROUND, DANGER, FIELD_MED, FIELD_NARROW,
-                     FIELD_WIDE, MUTED, PRIMARY, PRIMARY_DARK, SURFACE)
+from ..theme import (ACCENT, DANGER, FIELD_MED, FIELD_NARROW,
+                     FIELD_WIDE, MUTED, PRIMARY, PRIMARY_DARK, SURFACE,
+                     bottom_allowance)
 from ..utils import field_text, rounded_border, to_decimal
-from ..widgets import fields, section, set_status, status_text
+from ..widgets import badge, fields, section, set_status, status_text
 
 # (key, label, icon, colour) for each slot of Saint's payment window.
 PAYMENT_SLOTS = [
@@ -28,6 +34,8 @@ PAYMENT_SLOTS = [
     ("other2", "Otro instrumento 2", ft.Icons.ACCOUNT_BALANCE_WALLET,
      ft.Colors.BROWN_500),
 ]
+_SLOT_SPEC = {key: (label, icon, colour)
+              for key, label, icon, colour in PAYMENT_SLOTS}
 
 # Cash only needs the amount: no number, bank or type.
 _AMOUNT_ONLY_SLOTS = ("cash",)
@@ -79,10 +87,12 @@ def _label(code: str, name: str) -> str:
 
 
 class TotaliseView:
-    def __init__(self, ctx: AppContext, on_saved: Callable[[], None]):
+    def __init__(self, ctx: AppContext, on_saved: Callable[[], None],
+                 allows_credit: bool = True):
         self._ctx = ctx
         self._invoice = ctx.invoice
         self._on_saved = on_saved
+        self._allows_credit = allows_credit
         invoice = self._invoice
 
         self._global_discount = _number_field(
@@ -91,22 +101,52 @@ class TotaliseView:
             if invoice.global_discount_rate else "")
         self._financed = _number_field(
             "Monto a financiar",
-            f"{invoice.financed}" if invoice.financed else "")
+            f"{invoice.financed}"
+            if invoice.financed and allows_credit else "")
         self._credit_days = _number_field(
-            "Días de crédito", str(invoice.credit_days), width=FIELD_NARROW)
+            "Días de crédito",
+            str(invoice.credit_days) if allows_credit else "0",
+            width=FIELD_NARROW)
+        # A customer without credit pays everything now.
+        self._financed.disabled = not allows_credit
+        self._credit_days.disabled = not allows_credit
 
         self._breakdown = ft.Column(spacing=6)
         self._summary_icon = ft.Icon(ft.Icons.INFO_OUTLINE, size=18,
                                      color=MUTED)
         self._summary = status_text()
         self._pickers_status = status_text("Cargando tipos y bancos…")
+        self._save_button = ft.Button(
+            content="Guardar", icon=ft.Icons.SAVE, height=44,
+            on_click=lambda e: asyncio.create_task(self._save(e)))
 
-        # Codes from a previous totalisation, applied once the options load.
+        # Options from cfinstru and bancos; None until they load. Slots
+        # added later take their options from here.
+        self._instruments: list[dict] | None = None
+        self._banks: list[dict] | None = None
+
+        # Codes from a previous save, applied once the options load.
         self._initial_type: dict[str, str] = {}
         self._initial_bank: dict[str, str] = {}
+
+        # Slots currently on screen, in the order they were added.
         self._slots: dict[str, _SlotFields] = {}
-        self._payment_blocks = [self._build_slot(*slot)
-                                for slot in PAYMENT_SLOTS]
+        self._slot_cards: dict[str, ft.Card] = {}
+        self._slot_list = ft.Column(spacing=12)
+        self._empty_hint = ft.Text(
+            "Aún no hay instrumentos. Agregue abajo los que use el cliente.",
+            size=13, color=MUTED)
+        self._add_buttons = ft.Row(wrap=True, spacing=8, run_spacing=8)
+        self._add_section = ft.Column(spacing=8, controls=[
+            ft.Text("Agregar instrumento", size=13, color=MUTED,
+                    weight=ft.FontWeight.W_500),
+            self._add_buttons,
+        ])
+
+        for payment in invoice.payments:
+            if payment.key in _SLOT_SPEC:
+                self._add_slot(payment.key, existing=payment)
+        self._refresh_slot_list()
 
         self._global_discount.on_change = self._recompute
         self._financed.on_change = self._recompute
@@ -117,13 +157,43 @@ class TotaliseView:
 
     async def open(self) -> None:
         self._recompute()
-        await self._ctx.navigator.push("/totalise", "Totalizar", ft.Column(
+
+        conditions = [fields(self._global_discount, self._financed,
+                             self._credit_days)]
+        if not self._allows_credit:
+            conditions.append(ft.Text(
+                "Cliente sin crédito: la factura debe pagarse completa.",
+                size=12, color=ft.Colors.ORANGE_800))
+
+        # Save and the balance stay pinned above the scrolling content, so
+        # they are always in reach however many instruments are added.
+        top_bar = ft.Container(
+            padding=ft.Padding(left=14, right=10, top=10, bottom=10),
+            border_radius=12, bgcolor=ft.Colors.WHITE,
+            shadow=ft.BoxShadow(blur_radius=8, spread_radius=0,
+                                offset=ft.Offset(0, 2),
+                                color=ft.Colors.with_opacity(
+                                    0.10, ft.Colors.BLACK)),
+            content=ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    self._summary_icon,
+                    ft.Container(expand=True, content=self._summary),
+                    self._save_button,
+                ]))
+
+        content = ft.Column(
             expand=True, scroll=ft.ScrollMode.AUTO, spacing=14,
             controls=[
                 section("Condiciones del documento", ft.Icons.TUNE,
-                        fields(self._global_discount, self._financed,
-                               self._credit_days),
-                        colour=ft.Colors.ORANGE_700),
+                        *conditions, colour=ft.Colors.ORANGE_700),
+                ft.Text("Instrumentos de pago", size=15,
+                        weight=ft.FontWeight.BOLD, color=PRIMARY_DARK),
+                self._pickers_status,
+                self._empty_hint,
+                self._slot_list,
+                self._add_section,
                 ft.Card(elevation=2, content=ft.Container(
                     padding=18, border_radius=12, bgcolor=SURFACE,
                     content=ft.Column(spacing=6, controls=[
@@ -138,25 +208,19 @@ class TotaliseView:
                         self._breakdown,
                     ]),
                 )),
-                ft.Text("Instrumentos de pago", size=15,
-                        weight=ft.FontWeight.BOLD, color=PRIMARY_DARK),
-                self._pickers_status,
-                *self._payment_blocks,
-                ft.Container(
-                    padding=12, border_radius=10, bgcolor=BACKGROUND,
-                    content=ft.Row(spacing=10, controls=[self._summary_icon,
-                                                         self._summary])),
-                ft.Row([ft.Button(content="Guardar", icon=ft.Icons.SAVE,
-                                  height=48, expand=True,
-                                  on_click=lambda e: asyncio.create_task(
-                                      self._save(e)))]),
-            ]))
+                bottom_allowance(),
+            ])
+
+        await self._ctx.navigator.push(
+            "/payment", "Detalles de pago",
+            ft.Column(expand=True, spacing=12, controls=[top_bar, content]))
         self._ctx.page.run_task(self._load_pickers)
 
-    def _build_slot(self, key: str, label: str, icon, colour: str
-                    ) -> ft.Card:
-        existing = next((p for p in self._invoice.payments if p.key == key),
-                        None)
+    # -------------------------------------------------------------- slots
+
+    def _add_slot(self, key: str, existing: PaymentSlot | None = None
+                  ) -> None:
+        label, icon, colour = _SLOT_SPEC[key]
         amount = _number_field("Monto",
                                f"{existing.amount}" if existing else "")
         amount.on_focus = lambda e: self._on_slot_focus(key)
@@ -164,35 +228,113 @@ class TotaliseView:
 
         if key in _AMOUNT_ONLY_SLOTS:
             self._slots[key] = _SlotFields(amount)
-            return section(label, icon, fields(amount), colour=colour)
+            body = fields(amount)
+        else:
+            reference = ft.TextField(
+                label="Número", width=FIELD_MED, border=rounded_border(10),
+                value=existing.reference if existing else "")
+            # Bank dropdown (from bancos) for every non-cash slot.
+            bank = ft.Dropdown(
+                label="Banco", width=FIELD_WIDE, border=rounded_border(10),
+                options=[], disabled=True)
+            # "Tipo" dropdown (from cfinstru). Cheque is fixed: disabled.
+            instrument = ft.Dropdown(
+                label="Tipo", width=FIELD_WIDE, border=rounded_border(10),
+                options=[], disabled=True)
+            if existing and existing.bank_code:
+                self._initial_bank[key] = existing.bank_code
+            if existing and existing.instrument:
+                self._initial_type[key] = existing.instrument
+            self._slots[key] = _SlotFields(amount, reference, bank,
+                                           instrument)
+            body = fields(amount, reference, instrument, bank)
+            self._apply_options(key)
 
-        reference = ft.TextField(
-            label="Número", width=FIELD_MED, border=rounded_border(10),
-            value=existing.reference if existing else "")
+        card = ft.Card(elevation=1, content=ft.Container(
+            padding=ft.Padding(left=16, right=8, top=10, bottom=16),
+            border_radius=12,
+            content=ft.Column(spacing=12, controls=[
+                ft.Row(spacing=10,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                       controls=[
+                           badge(ft.Icon(icon, size=18, color=colour),
+                                 colour, size=32, opacity=0.12),
+                           ft.Text(label, size=15, expand=True,
+                                   weight=ft.FontWeight.BOLD,
+                                   color=PRIMARY_DARK),
+                           ft.IconButton(
+                               ft.Icons.DELETE_OUTLINE, icon_color=DANGER,
+                               tooltip=f"Quitar {label}",
+                               on_click=lambda e: self._on_remove(key)),
+                       ]),
+                ft.Divider(height=1),
+                body,
+            ]),
+        ))
+        self._slot_cards[key] = card
+        self._slot_list.controls.append(card)
 
-        # Bank dropdown (from bancos) for every non-cash slot.
-        bank = ft.Dropdown(
-            label="Banco", width=FIELD_WIDE, border=rounded_border(10),
-            options=[], disabled=True)
-        if existing and existing.bank_code:
-            self._initial_bank[key] = existing.bank_code
+    def _on_add(self, key: str) -> None:
+        if key in self._slots:
+            return
+        self._add_slot(key)
+        self._refresh_slot_list()
+        self._recompute()
 
-        # "Tipo" dropdown (from cfinstru). Cheque is a fixed slot: disabled.
-        instrument = ft.Dropdown(
-            label="Tipo", width=FIELD_WIDE, border=rounded_border(10),
-            options=[], disabled=True)
-        if existing and existing.instrument:
-            self._initial_type[key] = existing.instrument
+    def _on_remove(self, key: str) -> None:
+        card = self._slot_cards.pop(key, None)
+        if card is not None:
+            self._slot_list.controls.remove(card)
+        self._slots.pop(key, None)
+        # Added again later, it starts empty.
+        self._initial_type.pop(key, None)
+        self._initial_bank.pop(key, None)
+        self._refresh_slot_list()
+        self._recompute()
 
-        self._slots[key] = _SlotFields(amount, reference, bank, instrument)
-        return section(label, icon,
-                       fields(amount, reference, instrument, bank),
-                       colour=colour)
+    def _refresh_slot_list(self) -> None:
+        """One add button per instrument not yet on screen."""
+        unused = [(key, label, icon, colour)
+                  for key, label, icon, colour in PAYMENT_SLOTS
+                  if key not in self._slots]
+        self._add_buttons.controls = [
+            ft.OutlinedButton(
+                content=label, icon=icon, icon_color=colour,
+                on_click=lambda e, k=key: self._on_add(k))
+            for key, label, icon, colour in unused]
+        self._add_section.visible = bool(unused)
+        self._empty_hint.visible = not self._slots
 
     # -------------------------------------------------------- pickers load
 
+    def _apply_options(self, key: str) -> None:
+        """Fills one slot's Tipo and Banco once the options are loaded."""
+        slot = self._slots.get(key)
+        if slot is None:
+            return
+
+        if key in _TYPE_SLOTS and self._instruments is not None:
+            dd = slot.instrument
+            codes = {r["code"] for r in self._instruments}
+            dd.options = [ft.DropdownOption(key=r["code"],
+                                            text=_label(r["code"], r["name"]))
+                          for r in self._instruments]
+            current = dd.value or self._initial_type.get(key, "")
+            dd.value = current if current in codes else None
+            dd.disabled = not self._instruments
+
+        if key in _BANK_SLOTS and self._banks is not None:
+            dd = slot.bank
+            codes = {r["code"] for r in self._banks}
+            dd.options = [ft.DropdownOption(key=r["code"],
+                                            text=_label(r["code"], r["name"]))
+                          for r in self._banks]
+            current = dd.value or self._initial_bank.get(key, "")
+            dd.value = current if current in codes else None
+            dd.disabled = not self._banks
+
     async def _load_pickers(self) -> None:
-        """Fills the Tipo (cfinstru) and Banco (bancos) dropdowns.
+        """Loads the Tipo (cfinstru) and Banco (bancos) options.
 
         Loaded on every opening so a type or bank created in Saint shows up
         without restarting the app.
@@ -208,47 +350,34 @@ class TotaliseView:
             page.update()
             return
 
-        type_codes = {row["code"] for row in instruments}
-        bank_codes = {row["code"] for row in banks}
-
-        for key in _TYPE_SLOTS:
-            dd = self._slots[key].instrument
-            dd.options = [ft.DropdownOption(key=r["code"],
-                                            text=_label(r["code"], r["name"]))
-                          for r in instruments]
-            current = dd.value or self._initial_type.get(key, "")
-            dd.value = current if current in type_codes else None
-            dd.disabled = not instruments
-
-        for key in _BANK_SLOTS:
-            dd = self._slots[key].bank
-            dd.options = [ft.DropdownOption(key=r["code"],
-                                            text=_label(r["code"], r["name"]))
-                          for r in banks]
-            current = dd.value or self._initial_bank.get(key, "")
-            dd.value = current if current in bank_codes else None
-            dd.disabled = not banks
+        self._instruments = instruments
+        self._banks = banks
+        for key in list(self._slots):
+            self._apply_options(key)
 
         msgs = []
         if not instruments:
             msgs.append("No hay tipos de pago registrados.")
         if not banks:
             msgs.append("No hay bancos registrados.")
-        if msgs:
-            set_status(self._pickers_status, "  ".join(msgs), error=True)
-        else:
-            set_status(self._pickers_status, "")
+        set_status(self._pickers_status, "  ".join(msgs), error=bool(msgs))
+        self._pickers_status.visible = bool(msgs)
         # Runs through run_task, so the automatic page update does not
         # apply here.
         page.update()
 
     # ------------------------------------------------------- calculations
 
+    def _financed_value(self) -> Decimal:
+        if not self._allows_credit:
+            return Decimal(0)
+        return to_decimal(self._financed.value)
+
     def _preview_total(self) -> Decimal:
         """The total under the discount and financing typed in here."""
         self._invoice.global_discount_rate = to_decimal(
             self._global_discount.value)
-        self._invoice.financed = to_decimal(self._financed.value)
+        self._invoice.financed = self._financed_value()
         return self._invoice.total
 
     def _slots_total(self, skip_key: str = "") -> Decimal:
@@ -321,7 +450,10 @@ class TotaliseView:
             self._summary_icon.color = colour
 
     def _fail(self, text: str) -> None:
-        self._set_summary(text, DANGER)
+        self._set_summary(text, DANGER, ft.Icons.ERROR_OUTLINE)
+        # _save runs as a task launched from a lambda, after the automatic
+        # update of the click has already happened.
+        self._ctx.page.update()
 
     def _recompute(self, e=None) -> None:
         self._refresh_breakdown()
@@ -329,14 +461,19 @@ class TotaliseView:
         assigned = self._slots_total()
         pending = payable - assigned
         if assigned == 0:
-            self._set_summary("Sin desglose: lo no financiado se cobra en "
-                              "efectivo.", MUTED, ft.Icons.INFO_OUTLINE)
+            if self._allows_credit:
+                self._set_summary("Sin instrumentos: lo no financiado se "
+                                  "cobra en efectivo.", MUTED,
+                                  ft.Icons.INFO_OUTLINE)
+            else:
+                self._set_summary(f"Por cobrar: {payable:,.2f}",
+                                  ft.Colors.ORANGE_800,
+                                  ft.Icons.INFO_OUTLINE)
         elif pending == 0:
-            self._set_summary(f"Cuadra con lo cobrado: {payable:,.2f}",
+            self._set_summary(f"Cuadra: {payable:,.2f}",
                               ft.Colors.GREEN_700, ft.Icons.CHECK_CIRCLE)
         else:
-            self._set_summary(f"Pendiente: {pending:,.2f}   "
-                              f"(a cobrar {payable:,.2f})",
+            self._set_summary(f"Pendiente: {pending:,.2f}",
                               DANGER, ft.Icons.ERROR_OUTLINE)
 
     # ---------------------------------------------------- focus auto-fill
@@ -348,18 +485,18 @@ class TotaliseView:
         proposes the remaining balance, so a single instrument takes the
         whole amount and the next one only what is left.
         """
-        amount = self._slots[key].amount
-        if to_decimal(amount.value) > 0:
+        slot = self._slots.get(key)
+        if slot is None or to_decimal(slot.amount.value) > 0:
             return
         self._preview_total()
         pending = self._invoice.payable - self._slots_total(skip_key=key)
         if pending > 0:
-            amount.value = f"{pending:.2f}"
+            slot.amount.value = f"{pending:.2f}"
             self._recompute()
 
     def _on_financed_focus(self, e) -> None:
         """Propose as financed whatever the instruments leave unassigned."""
-        if to_decimal(self._financed.value) > 0:
+        if not self._allows_credit or to_decimal(self._financed.value) > 0:
             return
         invoice = self._invoice
         invoice.global_discount_rate = to_decimal(self._global_discount.value)
@@ -376,8 +513,11 @@ class TotaliseView:
     def _collect_slots(self) -> list[PaymentSlot] | None:
         """The filled slots, or None when one of them is incomplete."""
         slots = []
+        # Saint's slot order, whatever order they were added in.
         for key, label, _, _ in PAYMENT_SLOTS:
-            slot_fields = self._slots[key]
+            slot_fields = self._slots.get(key)
+            if slot_fields is None:
+                continue
             value = to_decimal(slot_fields.amount.value)
             if value <= 0:
                 continue
@@ -411,8 +551,9 @@ class TotaliseView:
             return
 
         invoice.global_discount_rate = rate
-        invoice.financed = to_decimal(self._financed.value)
-        invoice.credit_days = int(to_decimal(self._credit_days.value))
+        invoice.financed = self._financed_value()
+        invoice.credit_days = (int(to_decimal(self._credit_days.value))
+                               if self._allows_credit else 0)
 
         if invoice.financed > invoice.total:
             self._fail("Lo financiado excede el total.")
@@ -420,6 +561,11 @@ class TotaliseView:
 
         slots = self._collect_slots()
         if slots is None:
+            return
+
+        if not self._allows_credit and not slots:
+            self._fail("Cliente sin crédito: agregue al menos un "
+                       "instrumento de pago.")
             return
 
         assigned = sum((s.amount for s in slots), Decimal(0))

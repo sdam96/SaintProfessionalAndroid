@@ -11,6 +11,10 @@ from ..widgets import amount_text
 
 _WHITE_SOFT = ft.Colors.with_opacity(0.85, ft.Colors.WHITE)
 
+# Size of the grand total in each layout; a phone has less width for it.
+_TOTAL_SIZE_TABLET = 28
+_TOTAL_SIZE_PHONE = 22
+
 
 def _labelled(label: str, control: ft.Control, size: int = 14,
               visible: bool = True, colour: str = MUTED) -> ft.Row:
@@ -37,7 +41,8 @@ class TotalsPanel:
         self._subtotal = amount_text("0,00")
         self._tax = amount_text("0,00")
         self._igtf = amount_text("0,00")
-        self._total = ft.Text("0,00", size=28, weight=ft.FontWeight.BOLD,
+        self._total = ft.Text("0,00", size=_TOTAL_SIZE_TABLET,
+                              weight=ft.FontWeight.BOLD,
                               color=ft.Colors.WHITE)
         self._reference = ft.Text("", size=13, color=_WHITE_SOFT)
         self._paid = amount_text("0,00", size=13, colour=ft.Colors.GREEN_700)
@@ -86,11 +91,23 @@ class TotalsPanel:
                 f"{invoice.total_in_reference:,.2f} {invoice.reference_label}"
                 f"  @ {invoice.reference_rate:,.2f}")
 
+    # ------------------------------------------------------------- layout
+
     def build(self, *, foreign_switch: ft.Control,
               totalise_button: ft.Control, message: ft.Control,
-              issue_button: ft.Control) -> ft.Container:
+              issue_button: ft.Control, hint: ft.Control | None = None,
+              compact: bool = False) -> ft.Container:
+        """The totals block with its actions.
+
+        It never fixes its own height: on a phone it is the last section of
+        the scrolling screen, so the actions are reachable at any screen
+        size, font scale or system-bar height. `compact` stacks every
+        control on its own row so nothing has to share a narrow width.
+        `hint`, under the main button, says why it is disabled.
+        """
+        self._total.size = _TOTAL_SIZE_PHONE if compact else _TOTAL_SIZE_TABLET
         total_block = ft.Container(
-            padding=16, border_radius=12,
+            padding=14 if compact else 16, border_radius=12,
             gradient=ft.LinearGradient(
                 begin=ft.Alignment.CENTER_LEFT,
                 end=ft.Alignment.CENTER_RIGHT,
@@ -107,26 +124,47 @@ class TotalsPanel:
                 self._reference_row,
             ]))
 
-        return ft.Container(
-            padding=16,
-            bgcolor=ft.Colors.WHITE,
-            border_radius=ft.BorderRadius(top_left=18, top_right=18,
-                                          bottom_left=0, bottom_right=0),
-            content=ft.Column(spacing=8, controls=[
+        breakdown: list[ft.Control] = [
+            _labelled("Bruto", self._gross),
+            _labelled("Descuento", self._line_discount),
+            self._global_discount_row,
+            _labelled("Subtotal", self._subtotal),
+            self._tax_breakdown,
+            self._igtf_row,
+            ft.Container(height=4),
+            total_block,
+            _labelled("Cobrado", self._paid, size=13),
+            self._financed_row,
+        ]
+
+        if compact:
+            controls = [
+                ft.Row([foreign_switch]),
+                ft.Divider(height=6),
+                *breakdown,
+                ft.Container(height=4),
+                ft.Row([totalise_button]),
+                message,
+                ft.Row([issue_button]),
+            ]
+            if hint is not None:
+                controls.append(hint)
+        else:
+            controls = [
                 ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                        controls=[foreign_switch, totalise_button]),
                 ft.Divider(height=6),
-                _labelled("Bruto", self._gross),
-                _labelled("Descuento", self._line_discount),
-                self._global_discount_row,
-                _labelled("Subtotal", self._subtotal),
-                self._tax_breakdown,
-                self._igtf_row,
-                ft.Container(height=4),
-                total_block,
-                _labelled("Cobrado", self._paid, size=13),
-                self._financed_row,
+                *breakdown,
                 message,
                 ft.Row([issue_button]),
-            ]),
+            ]
+            if hint is not None:
+                controls.append(hint)
+
+        return ft.Container(
+            padding=16,
+            bgcolor=ft.Colors.WHITE,
+            border_radius=(12 if compact else ft.BorderRadius(
+                top_left=18, top_right=18, bottom_left=0, bottom_right=0)),
+            content=ft.Column(spacing=8, controls=controls),
         )

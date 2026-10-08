@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import flet as ft
 
-from .theme import BACKGROUND, PRIMARY
+from .theme import BACKGROUND, PRIMARY, bottom_allowance
 
 
 class Navigator:
@@ -28,6 +28,12 @@ class Navigator:
                                     icon_color=ft.Colors.WHITE,
                                     on_click=self.back)
 
+        # A screen that scrolls as a whole gets the closing allowance, so its
+        # last button can always be scrolled above the navigation bar.
+        # Screens with their own inner scroll add it themselves.
+        if isinstance(body, ft.Column) and body.scroll:
+            body.controls.append(bottom_allowance())
+
         view = ft.View(
             route=route,
             bgcolor=BACKGROUND,
@@ -37,7 +43,10 @@ class Navigator:
                 leading=leading,
             ),
             padding=16,
-            controls=[body],
+            # Keeps the last control of every screen (usually its main
+            # button) above the system navigation bar, which an
+            # edge-to-edge Android draws over the app.
+            controls=[ft.SafeArea(expand=True, content=body)],
         )
         self._page.views.append(view)
         await self._page.push_route(route)
