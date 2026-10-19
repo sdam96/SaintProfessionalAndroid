@@ -123,7 +123,7 @@ class SerialPicker:
         self._results.controls = [loading_indicator()]
         page.update()
         try:
-            items = await self._ctx.api.serials(self._product_code,
+            items = await self._ctx.catalog.serials(self._product_code,
                                                 self._warehouse_code)
         except ApiError as exc:
             self._results.controls = [status_text(str(exc), error=True)]

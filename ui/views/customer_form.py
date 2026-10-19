@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import flet as ft
 
-from api_client import ApiError
+from api_client import ApiError, ApiNetworkError
 from models import PRICE_LISTS
 
 from ..context import AppContext
@@ -104,6 +104,13 @@ class CustomerForm:
 
         try:
             created = await self._ctx.api.create_customer(self._payload())
+        except ApiNetworkError:
+            self._ctx.sync.report_network_error()
+            set_status(self._message,
+                       "Sin conexión: el cliente no se guardó. Crear "
+                       "clientes requiere conexión con el servidor.",
+                       error=True)
+            return
         except ApiError as exc:
             set_status(self._message, str(exc), error=True)
             return

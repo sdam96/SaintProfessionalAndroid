@@ -28,6 +28,13 @@ DANGER = ft.Colors.RED_600
 MUTED = ft.Colors.BLUE_GREY_600
 BACKGROUND = ft.Colors.BLUE_GREY_50
 
+# Connection state. Offline must be impossible to miss, so it takes over the
+# app bar colour as well as showing a banner on every screen.
+OFFLINE = ft.Colors.DEEP_ORANGE_800
+OFFLINE_DARK = ft.Colors.DEEP_ORANGE_900
+REVIEW = ft.Colors.RED_700
+SYNCING = ft.Colors.BLUE_700
+
 
 def bottom_allowance() -> ft.Container:
     """The closing space described by NAV_BAR_ALLOWANCE."""

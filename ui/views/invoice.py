@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 
 import flet as ft
 
-from api_client import ApiError
-from models import PRICE_LISTS, InvoiceLine
+from api_client import ApiError, ApiNetworkError
+from models import PRICE_LISTS, Invoice, InvoiceLine
+from offline_store import new_invoice_id
+from ui.views.sync import now_iso
 
 from ..context import AppContext
-from ..theme import (ACCENT, BACKGROUND, DANGER, FIELD_MED, MUTED, PRIMARY,
-                     PRIMARY_DARK, bottom_allowance)
+from ..theme import (ACCENT, BACKGROUND, DANGER, FIELD_MED, MUTED, OFFLINE,
+                     PRIMARY, PRIMARY_DARK, bottom_allowance)
 from ..utils import rounded_border, to_decimal
 from ..widgets import badge, fields, set_status, status_text, tag_row
 from .customer_form import CustomerForm
@@ -23,6 +25,9 @@ from .totals_panel import TotalsPanel
 
 PAYMENT_BUTTON_LABEL = "Detalles de pago"
 ISSUE_BUTTON_LABEL = "Totalizar"
+# Offline the button does not issue anything: it keeps the invoice on the
+# phone, and its label says so.
+OFFLINE_ISSUE_LABEL = "Guardar sin conexión"
 
 
 def _allows_credit(customer: dict) -> bool:
@@ -110,8 +115,12 @@ def _empty_lines(compact: bool = False) -> ft.Container:
 
 
 class InvoiceScreen:
-    def __init__(self, ctx: AppContext):
+    def __init__(self, ctx: AppContext,
+                 open_pending: Callable[[], Awaitable[None]]):
         self._ctx = ctx
+        self._open_pending = open_pending
+        # The connection banner at the top of this screen.
+        self._banner: ft.Control | None = None
         self._invoice = ctx.invoice
         self._totals = TotalsPanel()
 
@@ -168,6 +177,9 @@ class InvoiceScreen:
             f"«{PAYMENT_BUTTON_LABEL}» para poder totalizar.",
             size=12, color=ft.Colors.ORANGE_800, visible=False)
 
+        # The issue button follows the connection state.
+        ctx.sync.subscribe(self._on_connection_change)
+
     # ------------------------------------------------------------- layout
 
     async def show(self, info: dict) -> None:
@@ -177,19 +189,30 @@ class InvoiceScreen:
         if self._ctx.warehouses:
             self._warehouse.value = self._invoice.warehouse
 
+        appbar = ft.AppBar(
+            title=ft.Text("Nueva factura", weight=ft.FontWeight.W_500),
+            bgcolor=PRIMARY, color=ft.Colors.WHITE, elevation=2,
+            actions=[
+                ft.IconButton(
+                    ft.Icons.OUTBOX, icon_color=ft.Colors.WHITE,
+                    tooltip="Facturas guardadas sin conexión",
+                    on_click=lambda e: self._ctx.page.run_task(
+                        self._open_pending)),
+                ft.IconButton(
+                    ft.Icons.INFO_OUTLINE, icon_color=ft.Colors.WHITE,
+                    tooltip=f'{info.get("baseDatos", "")} · '
+                            f'est.{info.get("estacion", "")}'),
+            ],
+        )
+        self._ctx.indicator.attach_appbar(appbar)
+        self._banner = self._ctx.indicator.banner()
         view = ft.View(
             route="/invoice",
             bgcolor=BACKGROUND,
-            appbar=ft.AppBar(
-                title=ft.Text("Nueva factura", weight=ft.FontWeight.W_500),
-                bgcolor=PRIMARY, color=ft.Colors.WHITE, elevation=2,
-                actions=[ft.IconButton(
-                    ft.Icons.INFO_OUTLINE, icon_color=ft.Colors.WHITE,
-                    tooltip=f'{info.get("baseDatos", "")} · '
-                            f'est.{info.get("estacion", "")}')],
-            ),
+            appbar=appbar,
             padding=0,
-            controls=[self._body()],
+            spacing=0,
+            controls=[self._banner, self._body()],
         )
         self._view = view
         # On Android the first width can arrive late or change on rotation;
@@ -297,7 +320,7 @@ class InvoiceScreen:
     def _on_resize(self, e=None) -> None:
         if self._view is None or self._ctx.is_tablet() == self._tablet:
             return
-        self._view.controls = [self._body()]
+        self._view.controls = [self._banner, self._body()]
         self.refresh_lines()
         self._ctx.page.update()
 
@@ -319,6 +342,24 @@ class InvoiceScreen:
         blocked = self._issue_blocked()
         self._issue_button.disabled = blocked
         self._issue_hint.visible = blocked
+        self._apply_issue_label()
+
+    def _apply_issue_label(self) -> None:
+        if self._ctx.online:
+            self._issue_button.content = ISSUE_BUTTON_LABEL
+            self._issue_button.icon = ft.Icons.CHECK_CIRCLE
+            self._issue_button.bgcolor = None
+            self._issue_button.color = None
+        else:
+            self._issue_button.content = OFFLINE_ISSUE_LABEL
+            self._issue_button.icon = ft.Icons.SAVE
+            self._issue_button.bgcolor = OFFLINE
+            self._issue_button.color = ft.Colors.WHITE
+
+    def _on_connection_change(self) -> None:
+        # Not while a request is running: _issue restores the label itself.
+        if self._issue_button.content != "Procesando…":
+            self._apply_issue_label()
 
     def refresh_lines(self) -> None:
         compact = not self._tablet
@@ -348,6 +389,13 @@ class InvoiceScreen:
                                    on_create=self._open_customer_form)
 
     async def _open_customer_form(self) -> None:
+        # A customer created offline would not exist on the server when
+        # the invoice arrives, so creation needs the connection.
+        if not self._ctx.online:
+            self._ctx.page.show_dialog(ft.SnackBar(
+                ft.Text("Crear clientes requiere conexión con el servidor.",
+                        color=ft.Colors.WHITE), bgcolor=OFFLINE))
+            return
         await CustomerForm(self._ctx,
                            on_created=self._customer_created).open()
 
@@ -452,28 +500,89 @@ class InvoiceScreen:
                        "registre el pago antes de totalizar.", error=True)
             return
 
+        # The UUID that makes this invoice unique for the server. It is
+        # created once, here, and reused for every resend.
+        invoice_id = new_invoice_id()
+
+        if not self._ctx.online:
+            if any(line.serials for line in self._invoice.lines):
+                set_status(self._message,
+                           "Las facturas con seriales requieren conexión: "
+                           "otro equipo podría vender el mismo serial.",
+                           error=True)
+                return
+            await self._save_offline(invoice_id)
+            return
+
         page = self._ctx.page
         self._issue_button.disabled = True
         self._issue_button.content = "Procesando…"
         self._message.value = ""
         page.update()
 
+        result = None
+        lost = False
         try:
             result = await self._ctx.api.create_invoice(
-                self._invoice.to_json())
+                self._invoice.to_json(), invoice_id)
+        except ApiNetworkError:
+            # No answer: the server may or may not have issued it. Saved
+            # with the same UUID, resending later returns that invoice if
+            # it was issued, and issues it if it was not; never twice.
+            self._ctx.sync.report_network_error()
+            lost = True
         except ApiError as exc:
             set_status(self._message, str(exc), error=True)
-            return
         except Exception as exc:
             set_status(self._message, f"Error inesperado: {exc}", error=True)
-            return
         finally:
             self._issue_button.content = ISSUE_BUTTON_LABEL
             self._refresh_issue_state()
             page.update()
 
-        await open_result_view(self._ctx, result,
-                               on_new_invoice=self._new_invoice)
+        if lost:
+            await self._save_offline(invoice_id)
+        elif result is not None:
+            await open_result_view(self._ctx, result,
+                                   on_new_invoice=self._new_invoice)
+
+    async def _save_offline(self, invoice_id: str) -> None:
+        invoice = self._invoice
+        captured = now_iso()
+        total = f"{invoice.total:.2f}"
+        self._ctx.sync.save_offline(invoice_id, invoice, captured)
+        await open_result_view(
+            self._ctx,
+            {"offlineId": invoice_id, "total": total, "date": captured},
+            on_new_invoice=self._new_invoice, saved_offline=True)
+
+    # ------------------------------------------------------ held invoices
+
+    def load_invoice(self, held: Invoice) -> None:
+        """Puts a held invoice back on screen to be corrected and issued
+        again, as a new invoice with a new UUID."""
+        invoice = self._invoice
+        invoice.copy_from(held)
+        self._set_customer(invoice.customer_code, invoice.customer_name)
+        self._salesperson_button.content = (
+            f"{invoice.salesperson_code} — {invoice.salesperson_name}"
+            if invoice.salesperson_name
+            else f"Vendedor {invoice.salesperson_code}")
+        self._price_list.value = str(invoice.price_list)
+        self._warehouse.value = invoice.warehouse
+        self._foreign_switch.value = invoice.foreign_currency
+        self._totalise_button.content = PAYMENT_BUTTON_LABEL
+        self._message.value = ""
+
+        # Whether the customer may buy on credit, from the local copy.
+        self._allows_credit = True
+        for item in self._ctx.store.search("customers",
+                                           invoice.customer_code, 20):
+            if item.get("code") == invoice.customer_code:
+                self._allows_credit = _allows_credit(item)
+                break
+        self._apply_credit_rule(self._allows_credit)
+        self.refresh_lines()
 
     def _new_invoice(self) -> None:
         self._invoice.reset()

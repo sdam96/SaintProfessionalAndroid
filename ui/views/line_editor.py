@@ -10,7 +10,7 @@ import flet as ft
 from models import PRICE_LISTS, InvoiceLine
 
 from ..context import AppContext
-from ..theme import ACCENT, FIELD_MED, FIELD_NARROW, PRIMARY
+from ..theme import ACCENT, FIELD_MED, FIELD_NARROW, OFFLINE, PRIMARY
 from ..utils import rounded_border, to_decimal
 from ..widgets import fields, section, set_status, status_text
 from .serials import SerialPicker
@@ -25,6 +25,9 @@ class LineEditor:
         self._serialised = bool(product.get("usesSerial"))
         self._chosen: list[str] = []
         _, _, price_key = PRICE_LISTS[ctx.invoice.price_list - 1]
+        # Catalogue price at this moment; an offline invoice carries it so
+        # the server can tell if the price changed before it arrived.
+        self._list_price = to_decimal(product.get(price_key, 0))
 
         self._quantity = ft.TextField(
             label="Cantidad", value="1", autofocus=True, width=FIELD_NARROW,
@@ -60,7 +63,18 @@ class LineEditor:
             section("Ubicación", ft.Icons.WAREHOUSE,
                     fields(self._warehouse), colour=ACCENT),
         ]
-        if self._serialised:
+        if self._serialised and not self._ctx.online:
+            # A serial cannot be reserved offline: another device could
+            # sell the same unit before this invoice reaches the server.
+            self._serials_button.disabled = True
+            controls.append(
+                section("Seriales", ft.Icons.QR_CODE,
+                        ft.Text("Este producto usa seriales y solo se puede "
+                                "facturar con conexión al servidor.",
+                                size=13, color=OFFLINE,
+                                weight=ft.FontWeight.W_500),
+                        colour=OFFLINE))
+        elif self._serialised:
             controls.append(
                 section("Seriales", ft.Icons.QR_CODE,
                         ft.Row([self._serials_button]),
@@ -151,6 +165,9 @@ class LineEditor:
         if rate < 0 or rate > 100:
             return "El descuento debe estar entre 0 y 100."
         if self._serialised:
+            if not self._ctx.online and not self._chosen:
+                return ("Sin conexión no se pueden facturar productos con "
+                        "seriales.")
             if qty != int(qty):
                 return ("Un producto con seriales no admite cantidades "
                         "fraccionarias.")
@@ -178,5 +195,6 @@ class LineEditor:
             discount_rate=rate,
             warehouse=self._line_warehouse,
             serials=list(self._chosen),
+            list_price=self._list_price,
         ))
         await self._ctx.navigator.back()

@@ -16,7 +16,7 @@ copyright = "Copyright (c) 2026. Saintnet Latinoamérica, inc"
 build_number = 1
 icon_background = "#1a1a2e"
 permissions = []
-target_arch = ["arm64-v8a"]
+target_arch = ["arm64-v8a", "armeabi-v7a", "x86_64"]
 
 [tool.flet.android]
 artifact = "Saint Professional Facturación"

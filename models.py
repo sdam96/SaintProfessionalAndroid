@@ -37,6 +37,10 @@ class InvoiceLine:
     # One serial per unit when the product is serialised. Saint deletes the
     # matching ivserial rows as the invoice is written.
     serials: list[str] = field(default_factory=list)
+    # The catalogue price of the chosen price list when the line was added.
+    # Sent only for an invoice made offline: if the server's price differs
+    # by then, it holds the invoice for review instead of issuing it.
+    list_price: Decimal = Decimal(0)
 
     @property
     def gross(self) -> Decimal:
@@ -53,7 +57,7 @@ class InvoiceLine:
         """Net of the line discount, before any global discount."""
         return self.gross - self.discount
 
-    def to_json(self) -> dict:
+    def to_json(self, offline: bool = False) -> dict:
         line = {
             "product": self.product_code,
             "quantity": float(self.quantity),
@@ -65,6 +69,8 @@ class InvoiceLine:
             line["discount"] = float(self.discount_rate)
         if self.serials:
             line["serials"] = list(self.serials)
+        if offline:
+            line["listPrice"] = float(self.list_price)
         return line
 
 
@@ -267,14 +273,18 @@ class Invoice:
                 used.update(line.serials)
         return used
 
-    def to_json(self) -> dict:
+    def to_json(self, offline_since: str = "") -> dict:
+        """The request body. `offline_since` (ISO time the invoice was
+        confirmed) marks it as made offline: the server then checks that
+        prices, stock, credit and the total are still what the phone saw,
+        and holds it for review if they are not."""
         payload = {
             "customer": self.customer_code,
             "salesperson": self.salesperson_code,
             "priceList": self.price_list,
             "user": self.user,
             "cashRegister": self.cash_register,
-            "lines": [l.to_json() for l in self.lines],
+            "lines": [l.to_json(bool(offline_since)) for l in self.lines],
         }
         if self.global_discount_rate > 0:
             payload["globalDiscount"] = float(self.global_discount_rate)
@@ -287,4 +297,29 @@ class Invoice:
         used = [p for p in self.payments if p.amount > 0]
         if used:
             payload["payment"] = {p.key: p.to_json() for p in used}
+        if offline_since:
+            payload["offline"] = {
+                "capturedAt": offline_since,
+                "expectedTotal": float(self.total),
+            }
         return payload
+
+    # ---------------------------------------------------------- correcting
+
+    def copy_from(self, other: "Invoice") -> None:
+        """Puts another invoice's content into this one, which the screens
+        share. Used to correct an invoice the server held for review.
+        Payments are not copied: they are entered again against the
+        current total."""
+        self.reset()
+        self.customer_code = other.customer_code
+        self.customer_name = other.customer_name
+        self.salesperson_code = other.salesperson_code
+        self.salesperson_name = other.salesperson_name
+        self.price_list = other.price_list
+        self.warehouse = other.warehouse
+        self.global_discount_rate = other.global_discount_rate
+        self.financed = other.financed
+        self.credit_days = other.credit_days
+        self.foreign_currency = other.foreign_currency
+        self.lines = list(other.lines)

@@ -341,8 +341,8 @@ class TotaliseView:
         """
         page = self._ctx.page
         try:
-            instruments = await self._ctx.api.payment_instruments()
-            banks = await self._ctx.api.banks()
+            instruments = await self._ctx.catalog.payment_instruments()
+            banks = await self._ctx.catalog.banks()
         except ApiError as exc:
             set_status(self._pickers_status,
                        f"No se pudieron cargar tipos/bancos: {exc}",

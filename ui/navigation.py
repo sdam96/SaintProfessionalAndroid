@@ -7,14 +7,22 @@ on top with the awaitable page.push_route; there is no pop_route.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import flet as ft
 
 from .theme import BACKGROUND, PRIMARY, bottom_allowance
+
+if TYPE_CHECKING:
+    from .views.status import ConnectionIndicator
 
 
 class Navigator:
     def __init__(self, page: ft.Page):
         self._page = page
+        # Set once the session exists; every pushed screen then carries the
+        # connection banner and an app bar that turns orange offline.
+        self.indicator: ConnectionIndicator | None = None
 
     async def _route_to_top(self) -> None:
         if self._page.views:
@@ -34,19 +42,28 @@ class Navigator:
         if isinstance(body, ft.Column) and body.scroll:
             body.controls.append(bottom_allowance())
 
+        appbar = ft.AppBar(
+            title=ft.Text(title, weight=ft.FontWeight.W_500),
+            bgcolor=PRIMARY, color=ft.Colors.WHITE, elevation=2,
+            leading=leading,
+        )
+        # Keeps the last control of every screen (usually its main button)
+        # above the system navigation bar, which an edge-to-edge Android
+        # draws over the app.
+        content: list[ft.Control] = [ft.SafeArea(
+            expand=True,
+            content=ft.Container(expand=True, padding=16, content=body))]
+        if self.indicator is not None:
+            self.indicator.attach_appbar(appbar)
+            content.insert(0, self.indicator.banner())
+
         view = ft.View(
             route=route,
             bgcolor=BACKGROUND,
-            appbar=ft.AppBar(
-                title=ft.Text(title, weight=ft.FontWeight.W_500),
-                bgcolor=PRIMARY, color=ft.Colors.WHITE, elevation=2,
-                leading=leading,
-            ),
-            padding=16,
-            # Keeps the last control of every screen (usually its main
-            # button) above the system navigation bar, which an
-            # edge-to-edge Android draws over the app.
-            controls=[ft.SafeArea(expand=True, content=body)],
+            appbar=appbar,
+            padding=0,
+            spacing=0,
+            controls=content,
         )
         self._page.views.append(view)
         await self._page.push_route(route)

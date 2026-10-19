@@ -4,16 +4,19 @@ from decimal import Decimal
 
 import flet as ft
 
-from api_client import ApiError
+from api_client import ApiError, ApiNetworkError
 from discovery import DiscoveredServer, discover
 from models import Invoice
+from offline_store import OfflineStore
 
 from .context import AppContext
 from .navigation import Navigator
+from .views.status import ConnectionIndicator
 from .theme import BACKGROUND
 from .utils import to_decimal
 from .views.connection import ConnectionForm, splash_view
 from .views.invoice import InvoiceScreen
+from .views.pending import PendingView
 
 SERVER_URL_KEY = "saintpro.server_url"
 
@@ -33,9 +36,15 @@ def _configure_invoice(invoice: Invoice, info: dict) -> None:
 class SaintApp:
     def __init__(self, page: ft.Page):
         self._page = page
-        self._ctx = AppContext(page=page, navigator=Navigator(page))
+        navigator = Navigator(page)
+        self._ctx = AppContext(page=page, navigator=navigator,
+                               store=OfflineStore())
+        self._ctx.indicator = ConnectionIndicator(page, self._ctx.sync,
+                                                  self._open_pending)
+        navigator.indicator = self._ctx.indicator
         self._prefs = ft.SharedPreferences()
-        self._invoice_screen = InvoiceScreen(self._ctx)
+        self._invoice_screen = InvoiceScreen(self._ctx,
+                                             open_pending=self._open_pending)
         self._form = ConnectionForm(on_connect=self._connect,
                                     on_search=self._search,
                                     on_pick_server=self._pick_server)
@@ -55,6 +64,7 @@ class SaintApp:
             saved_url = await self._prefs.get(SERVER_URL_KEY)
         except Exception:
             pass
+        saved_url = saved_url or self._ctx.sync.cached_url()
 
         # The saved address goes first: it is the fastest path and the only
         # one that works for a server outside this network.
@@ -70,10 +80,19 @@ class SaintApp:
             splash_view("Buscando servidor en la red…"))
         if await self._discover_and_connect(automatic=True):
             return
+
+        # No server anywhere: work offline with what was last downloaded,
+        # if this phone has ever connected.
+        if saved_url and await self._enter_offline(saved_url):
+            return
         await self._show_setup()
 
     async def _show_setup(self) -> None:
         await self._ctx.navigator.set_root(self._form.view())
+
+    async def _open_pending(self) -> None:
+        await PendingView(self._ctx,
+                          on_correct=self._invoice_screen.load_invoice).open()
 
     # --------------------------------------------------------- discovery
 
@@ -137,13 +156,15 @@ class SaintApp:
     async def _do_connect(self, url: str) -> bool:
         if not url.startswith("http"):
             url = "http://" + url
-        api = self._ctx.api
-        api.base_url = url
+        ctx = self._ctx
+        ctx.api.base_url = url
 
         try:
-            info = await api.status()
-            rows = await api.warehouses()
+            info = await ctx.api.status()
+            rows = await ctx.api.warehouses()
         except ApiError as exc:
+            if isinstance(exc, ApiNetworkError):
+                ctx.sync.report_network_error()
             self._form.set_status(str(exc), error=True)
             return False
 
@@ -153,14 +174,46 @@ class SaintApp:
         except Exception:
             pass
 
-        invoice = self._ctx.invoice
+        ctx.sync.remember_server(info)
+        ctx.store.replace_catalog("warehouses", rows)
+        await self._open_session(info, rows)
+        ctx.sync.set_online(True)
+        # The offline copy is brought up to date, and anything saved while
+        # offline is sent, without making the user wait for either.
+        self._page.run_task(self._after_connect)
+        return True
+
+    async def _after_connect(self) -> None:
+        await self._ctx.sync.refresh_catalogs()
+        await self._ctx.sync.send_pending()
+
+    async def _enter_offline(self, url: str) -> bool:
+        """Opens the invoice screen with the last downloaded data.
+
+        Only possible after at least one successful connection: without
+        the catalogues there is nothing to invoice with.
+        """
+        ctx = self._ctx
+        info = ctx.sync.cached_info()
+        if not info or not ctx.store.has_catalogs():
+            return False
+        ctx.api.base_url = url
+        ctx.sync.database = str(info.get("baseDatos") or "")
+        ctx.sync.set_online(False)
+        await self._open_session(info, ctx.store.search("warehouses",
+                                                         limit=500))
+        return True
+
+    async def _open_session(self, info: dict, warehouses: list[dict]) -> None:
+        ctx = self._ctx
+        invoice = ctx.invoice
         _configure_invoice(invoice, info)
 
-        self._ctx.warehouses.clear()
-        self._ctx.warehouses.extend(rows)
-        if rows:
-            invoice.warehouse = rows[0]["code"]
+        ctx.warehouses.clear()
+        ctx.warehouses.extend(warehouses)
+        if warehouses:
+            invoice.warehouse = warehouses[0]["code"]
 
         self._form.set_status("")
+        ctx.sync.start()
         await self._invoice_screen.show(info)
-        return True

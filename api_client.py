@@ -17,13 +17,35 @@ API_KEY_HEADER = "X-API-Key"
 # keeps the longer limit because issuing an invoice can take a while.
 CONNECT_TIMEOUT = 8.0
 
+# Header carrying the invoice's UUID. The server keeps the result of every
+# key it has processed, so sending the same invoice again (a retry after a
+# timeout, or the offline queue) returns that result instead of issuing a
+# second invoice. Name as in the IETF draft "The Idempotency-Key HTTP
+# Header Field".
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+
 
 class ApiError(Exception):
-    """Carries the message the server sent back, not the raw HTTP status."""
+    """Carries the message the server sent back, not the raw HTTP status.
 
-    def __init__(self, message: str, status: int = 0):
+    `code` is the machine-readable reason the server may add next to the
+    message ({"error": "...", "code": "REVIEW"}); empty when it sent none.
+    """
+
+    def __init__(self, message: str, status: int = 0, code: str = ""):
         super().__init__(message)
         self.status = status
+        self.code = code
+
+
+class ApiNetworkError(ApiError):
+    """The server could not be reached, or did not answer in time.
+
+    Unlike other ApiErrors this says nothing about the request itself: the
+    server may never have received it, or may have processed it and the
+    answer was lost. That is why an invoice is always sent with its
+    idempotency key: resending it is then safe in both cases.
+    """
 
 
 def _named(rows: list[dict]) -> list[dict]:
@@ -72,25 +94,32 @@ class ApiClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/api/v1{path}"
 
-    async def _request(self, method: str, path: str, **kwargs) -> Any:
+    async def _request(self, method: str, path: str,
+                       timeout: httpx.Timeout | None = None,
+                       **kwargs) -> Any:
         headers = kwargs.pop("headers", {})
         headers[API_KEY_HEADER] = API_KEY
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(
+                    timeout=timeout or self.timeout) as client:
                 response = await client.request(
                     method, self._url(path), headers=headers, **kwargs)
         except httpx.RequestError as exc:
-            raise ApiError(_describe(exc)) from exc
+            raise ApiNetworkError(_describe(exc)) from exc
 
         if response.status_code >= 400:
-            # The API answers errors as {"error": "..."} in Spanish.
+            # The API answers errors as {"error": "...", "code": "..."} in
+            # Spanish; "code" is optional.
+            code = ""
             try:
-                detail = response.json().get("error", response.text)
+                body = response.json()
+                detail = body.get("error", response.text)
+                code = str(body.get("code") or "")
             except (ValueError, AttributeError):
                 detail = response.text
             raise ApiError(
                 detail or f"El servidor respondió {response.status_code}.",
-                response.status_code)
+                response.status_code, code)
 
         # Something other than this API may be answering on that address
         # (a router page, another program on the same port, a proxy).
@@ -102,8 +131,11 @@ class ApiClient:
                 f"Professional (respuesta {response.status_code} sin JSON).",
                 response.status_code) from exc
 
-    async def status(self) -> dict:
-        return await self._request("GET", "/status")
+    async def status(self, quick: bool = False) -> dict:
+        """The server's /status. `quick` uses short limits, for the
+        connection checks that run in the background."""
+        timeout = httpx.Timeout(4.0, connect=3.0) if quick else None
+        return await self._request("GET", "/status", timeout=timeout)
 
     async def customers(self, search: str = "", limit: int = 100) -> list[dict]:
         params = {
@@ -182,5 +214,10 @@ class ApiClient:
         rows = (await self._request("GET", "/banks", params=params))["data"]
         return _with_code(rows)
 
-    async def create_invoice(self, payload: dict) -> dict:
-        return await self._request("POST", "/invoices", json=payload)
+    async def create_invoice(self, payload: dict,
+                             idempotency_key: str) -> dict:
+        """Issues an invoice. The same key always yields the same invoice:
+        the server answers a repeated key with the stored result."""
+        return await self._request(
+            "POST", "/invoices", json=payload,
+            headers={IDEMPOTENCY_HEADER: idempotency_key})

@@ -11,7 +11,7 @@ from api_client import ApiError
 from models import PRICE_LISTS
 
 from ..context import AppContext
-from ..theme import ACCENT, DANGER, MUTED, PRIMARY, PRIMARY_DARK
+from ..theme import ACCENT, DANGER, MUTED, OFFLINE, PRIMARY, PRIMARY_DARK
 from ..utils import rounded_border, to_decimal
 from ..widgets import (badge, loading_indicator, picker_card, status_text,
                        tag_row)
@@ -64,8 +64,17 @@ class SearchPicker:
             page.update()
             return
 
-        self._results.controls = (self._build_cards(items)
-                                  or [status_text("Sin resultados")])
+        cards = (self._build_cards(items)
+                 or [status_text("Sin resultados")])
+        if not self._ctx.online:
+            # Offline the list comes from the phone's copy, which may be
+            # older than the server's.
+            age = self._ctx.store.catalog_age().replace("T", " ")
+            cards.insert(0, ft.Text(
+                "Sin conexión: datos guardados en el teléfono"
+                + (f" (actualizados {age})" if age else "") + ".",
+                size=12, color=OFFLINE, weight=ft.FontWeight.W_500))
+        self._results.controls = cards
         # _load() also runs through run_task, not as an event handler, so
         # the automatic page update does not always apply here.
         page.update()
@@ -93,7 +102,7 @@ async def open_customer_picker(ctx: AppContext, on_pick: OnPick,
 
     await SearchPicker(
         ctx, route="/customers", title="Clientes", label="Buscar cliente",
-        fetch=ctx.api.customers,
+        fetch=ctx.catalog.customers,
         build_cards=lambda items: [card(it) for it in items],
         trailing=ft.IconButton(
             ft.Icons.PERSON_ADD, icon_color=PRIMARY, tooltip="Crear cliente",
@@ -119,7 +128,7 @@ async def open_salesperson_picker(ctx: AppContext, on_pick: OnPick) -> None:
 
     await SearchPicker(
         ctx, route="/salespeople", title="Vendedores",
-        label="Buscar vendedor", fetch=ctx.api.salespeople,
+        label="Buscar vendedor", fetch=ctx.catalog.salespeople,
         build_cards=lambda items: [card(it) for it in items],
     ).open()
 
@@ -163,5 +172,5 @@ async def open_product_picker(ctx: AppContext,
 
     await SearchPicker(
         ctx, route="/products", title="Productos", label="Buscar producto",
-        fetch=ctx.api.products, build_cards=cards,
+        fetch=ctx.catalog.products, build_cards=cards,
     ).open()
