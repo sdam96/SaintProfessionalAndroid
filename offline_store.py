@@ -39,7 +39,8 @@ from pathlib import Path
 from models import Invoice, InvoiceLine, PaymentSlot
 
 DB_FILE = "saintpro_offline.db"
-SCHEMA_VERSION = 2
+# 3: pending_invoice_payments.foreign_currency (the per-slot "En divisas").
+SCHEMA_VERSION = 3
 
 # pending_invoices.status
 PENDING = "pending"   # waiting to be sent
@@ -209,6 +210,8 @@ CREATE TABLE pending_invoice_payments (
     reference  TEXT NOT NULL,
     bank_code  TEXT NOT NULL,
     instrument TEXT NOT NULL,
+    foreign_currency INTEGER NOT NULL DEFAULT 0
+                     CHECK (foreign_currency IN (0, 1)),
     PRIMARY KEY (invoice_id, key)
 );
 """
@@ -318,6 +321,17 @@ class OfflineStore:
     def _migrate(self) -> None:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
+            return
+        if version == 2:
+            # Only a column is added: the invoices waiting to be sent must
+            # survive the update. Their slots start in bolivares;
+            # Invoice.mark_legacy_foreign restores what the old switch said.
+            with self._db:
+                self._db.execute(
+                    "ALTER TABLE pending_invoice_payments ADD COLUMN "
+                    "foreign_currency INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (foreign_currency IN (0, 1))")
+                self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
         with self._db:
             for table in _OLD_TABLES:
@@ -461,7 +475,9 @@ class OfflineStore:
             for p in self._db.execute(
                 "SELECT * FROM pending_invoice_payments WHERE invoice_id = ? "
                 "ORDER BY rowid", (invoice_id,))]
-        return _from_row(Invoice, row, lines=lines, payments=payments)
+        invoice = _from_row(Invoice, row, lines=lines, payments=payments)
+        invoice.mark_legacy_foreign()
+        return invoice
 
     def _entry(self, row: sqlite3.Row) -> OutboxEntry:
         return _from_row(OutboxEntry, row, invoice=self._invoice(row))

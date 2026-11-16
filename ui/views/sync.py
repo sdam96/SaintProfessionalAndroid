@@ -189,20 +189,31 @@ class SyncService:
         if self.online:
             self._wake.set()
 
+    def _sendable(self) -> list:
+        """Pending invoices for the database this session works against.
+
+        Invoices made for another database are never sent here.
+        """
+        return [entry for entry in self._store.entries((PENDING,))
+                if not (entry.database_name and self.database and
+                        entry.database_name != self.database)]
+
     async def send_pending(self) -> None:
         """Sends the outbox, oldest first, until it is empty or the
         connection drops. Only one run at a time."""
         if self._lock.locked():
+            return
+        # Nothing to send: no "syncing" state and no notice to the screens.
+        # This runs on every connection check, so announcing an empty run
+        # made the status strip flash every 30 seconds.
+        if not self._sendable():
             return
         async with self._lock:
             self.syncing = True
             self._notify()
             sent = held = 0
             try:
-                for entry in self._store.entries((PENDING,)):
-                    if entry.database_name and self.database and \
-                            entry.database_name != self.database:
-                        continue
+                for entry in self._sendable():
                     outcome = await self._send(entry)
                     if outcome == "offline":
                         break

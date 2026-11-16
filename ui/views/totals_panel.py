@@ -93,8 +93,7 @@ class TotalsPanel:
 
     # ------------------------------------------------------------- layout
 
-    def build(self, *, foreign_switch: ft.Control,
-              totalise_button: ft.Control, message: ft.Control,
+    def build(self, *, totalise_button: ft.Control, message: ft.Control,
               issue_button: ft.Control, hint: ft.Control | None = None,
               compact: bool = False) -> ft.Container:
         """The totals block with its actions.
@@ -139,8 +138,6 @@ class TotalsPanel:
 
         if compact:
             controls = [
-                ft.Row([foreign_switch]),
-                ft.Divider(height=6),
                 *breakdown,
                 ft.Container(height=4),
                 ft.Row([totalise_button]),
@@ -151,8 +148,8 @@ class TotalsPanel:
                 controls.append(hint)
         else:
             controls = [
-                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                       controls=[foreign_switch, totalise_button]),
+                ft.Row(alignment=ft.MainAxisAlignment.END,
+                       controls=[totalise_button]),
                 ft.Divider(height=6),
                 *breakdown,
                 message,

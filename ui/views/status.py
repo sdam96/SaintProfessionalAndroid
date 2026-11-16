@@ -4,12 +4,15 @@ While the server cannot be reached the app must not look the same as when
 it can, so being offline changes three things at once:
 
 - Every app bar turns dark orange.
-- A banner sits at the top of every screen and cannot be closed. It says
-  that invoices are being kept on the phone and how many are waiting.
+- A status strip at the top of every screen turns orange and says how many
+  invoices are waiting on the phone.
 - A message appears the moment the connection is lost or comes back.
 
-The banner stays after the connection returns while saved invoices are
-still being sent, or while any of them needs the user's attention.
+The strip has the same height in every state and is never hidden, so a
+change of state never moves the screen: only its colour, icon and words
+change, with a short fade. A screen is redrawn only when the state really
+changed; the periodic connection check that finds everything as it was
+touches nothing.
 """
 
 from __future__ import annotations
@@ -19,34 +22,37 @@ from collections.abc import Awaitable, Callable
 import flet as ft
 
 from offline_store import HELD, PENDING
-from ui.views.sync import SyncService
+from .sync import SyncService
 
-from ..theme import OFFLINE, OFFLINE_DARK, PRIMARY, REVIEW, SYNCING
+from ..theme import (MUTED, OFFLINE, OFFLINE_DARK, PRIMARY, REVIEW, SURFACE,
+                     SYNCING)
 
-_WHITE_SOFT = ft.Colors.with_opacity(0.88, ft.Colors.WHITE)
+# One line of text plus its padding, in every state.
+STRIP_HEIGHT = 40
+# Colour and icon changes fade instead of switching at once.
+_FADE = ft.Animation(250, ft.AnimationCurve.EASE_IN_OUT)
 
 
-class _Banner:
+class _Strip:
     def __init__(self, on_click: Callable):
-        self.icon = ft.Icon(ft.Icons.CLOUD_OFF, color=ft.Colors.WHITE,
-                            size=26)
-        self.title = ft.Text("", size=14, weight=ft.FontWeight.BOLD,
-                             color=ft.Colors.WHITE)
-        self.detail = ft.Text("", size=12, color=_WHITE_SOFT)
+        self.icon = ft.Icon(ft.Icons.CLOUD_DONE, size=20)
+        self.title = ft.Text("", size=13, weight=ft.FontWeight.BOLD,
+                             max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
         self.count = ft.Text("", size=12, weight=ft.FontWeight.BOLD)
         self.count_chip = ft.Container(
-            padding=ft.Padding(left=10, right=10, top=4, bottom=4),
-            border_radius=12, bgcolor=ft.Colors.WHITE, content=self.count)
+            padding=ft.Padding(left=10, right=10, top=2, bottom=2),
+            border_radius=12, bgcolor=ft.Colors.WHITE, content=self.count,
+            opacity=0, animate_opacity=_FADE)
         self.control = ft.Container(
-            visible=False, ink=True, on_click=on_click,
-            padding=ft.Padding(left=14, right=12, top=10, bottom=10),
+            height=STRIP_HEIGHT, ink=True, on_click=on_click,
+            animate=_FADE,
+            padding=ft.Padding(left=14, right=12, top=0, bottom=0),
             content=ft.Row(
-                spacing=12,
+                spacing=10,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     self.icon,
-                    ft.Column(expand=True, spacing=2,
-                              controls=[self.title, self.detail]),
+                    ft.Container(expand=True, content=self.title),
                     self.count_chip,
                 ]))
 
@@ -57,21 +63,23 @@ class ConnectionIndicator:
         self._page = page
         self._sync = sync
         self._open_pending = open_pending
-        self._banners: list[_Banner] = []
+        self._strips: list[_Strip] = []
         self._appbars: list[ft.AppBar] = []
         self._was_online: bool | None = None
+        # What every strip shows now; refresh() compares against it.
+        self._shown: tuple | None = None
         sync.subscribe(self.refresh)
 
     # ------------------------------------------------------- registration
 
     def banner(self) -> ft.Container:
-        """A new banner for one screen. Each screen needs its own."""
-        banner = _Banner(on_click=self._on_click)
-        self._banners.append(banner)
+        """A new status strip for one screen. Each screen needs its own."""
+        strip = _Strip(on_click=self._on_click)
+        self._strips.append(strip)
         # Screens come and go; keep the list from growing without bound.
-        del self._banners[:-30]
-        self._apply_banner(banner)
-        return banner.control
+        del self._strips[:-30]
+        self._apply(strip, self._state())
+        return strip.control
 
     def attach_appbar(self, appbar: ft.AppBar) -> ft.AppBar:
         self._appbars.append(appbar)
@@ -84,64 +92,69 @@ class ConnectionIndicator:
 
     # -------------------------------------------------------------- state
 
-    def _state(self):
+    def _state(self) -> tuple:
+        """(background, foreground, icon, text, count, count colour)."""
         counts = self._sync.counts()
         pending, held = counts[PENDING], counts[HELD]
         if not self._sync.online:
-            detail = ("Las facturas se guardan en este teléfono y se "
-                      "enviarán solas al volver la conexión.")
-            if held:
-                detail += f" {held} requiere(n) revisión."
-            return (True, OFFLINE, ft.Icons.CLOUD_OFF,
-                    "SIN CONEXIÓN CON EL SERVIDOR", detail,
+            return (OFFLINE, ft.Colors.WHITE, ft.Icons.CLOUD_OFF,
+                    "SIN CONEXIÓN · se guardan en el teléfono",
                     f"{pending} por enviar" if pending else "", OFFLINE)
         if held:
-            return (True, REVIEW, ft.Icons.ERROR_OUTLINE,
-                    f"{held} factura(s) guardada(s) requieren revisión",
-                    "El servidor no las emitió. Toque para corregirlas o "
-                    "descartarlas.", f"{held}", REVIEW)
-        if pending or self._sync.syncing:
-            return (True, SYNCING, ft.Icons.SYNC,
+            return (REVIEW, ft.Colors.WHITE, ft.Icons.ERROR_OUTLINE,
+                    f"{held} factura(s) requieren revisión · toque aquí",
+                    f"{held}", REVIEW)
+        # Only when there really is something to send.
+        if pending:
+            return (SYNCING, ft.Colors.WHITE, ft.Icons.SYNC,
                     f"Enviando {pending} factura(s) guardada(s)…",
-                    "Se emiten con la fecha de hoy. No cierre la "
-                    "aplicación.", f"{pending}" if pending else "", SYNCING)
-        return (False, PRIMARY, ft.Icons.CLOUD_DONE, "", "", "", PRIMARY)
+                    f"{pending}", SYNCING)
+        return (SURFACE, MUTED, ft.Icons.CLOUD_DONE,
+                "Conectado al servidor", "", PRIMARY)
 
-    def _apply_banner(self, banner: _Banner, state=None) -> None:
-        visible, colour, icon, title, detail, count, count_colour = (
-            state or self._state())
-        banner.control.visible = visible
-        banner.control.bgcolor = colour
-        banner.icon.icon = icon
-        banner.title.value = title
-        banner.detail.value = detail
-        banner.count.value = count
-        banner.count.color = count_colour
-        banner.count_chip.visible = bool(count)
+    @staticmethod
+    def _apply(strip: _Strip, state: tuple) -> None:
+        background, foreground, icon, text, count, count_colour = state
+        strip.control.bgcolor = background
+        strip.icon.icon = icon
+        strip.icon.color = foreground
+        strip.title.value = text
+        strip.title.color = foreground
+        strip.count.value = count
+        strip.count.color = count_colour
+        # Faded out rather than hidden, so the strip keeps its layout.
+        strip.count_chip.opacity = 1 if count else 0
 
     def refresh(self) -> None:
         state = self._state()
-        for banner in self._banners:
-            self._apply_banner(banner, state)
-        for appbar in self._appbars:
-            appbar.bgcolor = PRIMARY if self._sync.online else OFFLINE_DARK
+        online = self._sync.online
+        changed = state != self._shown
+        if changed:
+            self._shown = state
+            for strip in self._strips:
+                self._apply(strip, state)
+            colour = PRIMARY if online else OFFLINE_DARK
+            for appbar in self._appbars:
+                appbar.bgcolor = colour
 
         message = None
-        if self._was_online is not None and self._was_online != \
-                self._sync.online:
-            message = ("Conexión restablecida." if self._sync.online else
+        if self._was_online is not None and self._was_online != online:
+            message = ("Conexión restablecida." if online else
                        "Sin conexión con el servidor. Las facturas se "
                        "guardarán en el teléfono.")
         elif self._sync.last_message:
             message = self._sync.last_message
         self._sync.last_message = ""
-        self._was_online = self._sync.online
+        self._was_online = online
 
         if message:
             self._page.show_dialog(ft.SnackBar(
                 ft.Text(message, color=ft.Colors.WHITE),
-                bgcolor=SYNCING if self._sync.online else OFFLINE,
+                bgcolor=SYNCING if online else OFFLINE,
                 duration=5000))
+        # Nothing changed and nothing to say: leave the screen alone.
+        if not changed and not message:
+            return
         try:
             self._page.update()
         except Exception:

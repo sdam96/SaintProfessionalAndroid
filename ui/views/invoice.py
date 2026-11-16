@@ -11,7 +11,7 @@ from offline_store import new_invoice_id
 from ui.views.sync import now_iso
 
 from ..context import AppContext
-from ..theme import (ACCENT, BACKGROUND, DANGER, FIELD_MED, MUTED, OFFLINE,
+from ..theme import (BACKGROUND, DANGER, FIELD_MED, MUTED, OFFLINE,
                      PRIMARY, PRIMARY_DARK, bottom_allowance)
 from ..utils import rounded_border, to_decimal
 from ..widgets import badge, fields, set_status, status_text, tag_row
@@ -147,10 +147,9 @@ class InvoiceScreen:
         self._warehouse = ft.Dropdown(
             label="Depósito", width=FIELD_MED, value="01",
             border=rounded_border(10))
-        self._foreign_switch = ft.Switch(label="Pago en divisa", value=False,
-                                         active_color=ACCENT)
-        for control in (self._price_list, self._warehouse,
-                        self._foreign_switch):
+        # Whether a payment is in divisas is set per instrument, in the
+        # payment details (TotaliseView).
+        for control in (self._price_list, self._warehouse):
             control.on_change = self._on_input_change
 
         # Never scrolls on its own: it always sits inside the scrolling
@@ -265,7 +264,6 @@ class InvoiceScreen:
             padding=ft.Padding(left=16, right=16, top=12, bottom=16),
             content=self._lines)
         panel = self._totals.build(
-            foreign_switch=self._foreign_switch,
             totalise_button=self._totalise_button,
             message=self._message,
             issue_button=self._issue_button,
@@ -304,7 +302,6 @@ class InvoiceScreen:
         panel = ft.Container(
             padding=ft.Padding(left=12, right=12, top=8, bottom=16),
             content=self._totals.build(
-                foreign_switch=self._foreign_switch,
                 totalise_button=self._totalise_button,
                 message=self._message,
                 issue_button=self._issue_button,
@@ -330,7 +327,6 @@ class InvoiceScreen:
         invoice = self._invoice
         invoice.price_list = int(to_decimal(self._price_list.value, 1))
         invoice.warehouse = self._warehouse.value or invoice.warehouse
-        invoice.foreign_currency = self._foreign_switch.value
         self._totals.refresh(invoice)
         self._refresh_issue_state()
 
@@ -380,6 +376,7 @@ class InvoiceScreen:
 
     def _invalidate_payments(self) -> None:
         self._invoice.payments.clear()
+        self._invoice.sync_foreign_currency()
         self._totalise_button.content = PAYMENT_BUTTON_LABEL
 
     # ----------------------------------------------------------- customer
@@ -570,7 +567,6 @@ class InvoiceScreen:
             else f"Vendedor {invoice.salesperson_code}")
         self._price_list.value = str(invoice.price_list)
         self._warehouse.value = invoice.warehouse
-        self._foreign_switch.value = invoice.foreign_currency
         self._totalise_button.content = PAYMENT_BUTTON_LABEL
         self._message.value = ""
 
@@ -589,6 +585,5 @@ class InvoiceScreen:
         self._customer_button.content = "Seleccionar cliente"
         self._totalise_button.content = PAYMENT_BUTTON_LABEL
         self._allows_credit = True
-        self._foreign_switch.value = False
         self._message.value = ""
         self.refresh_lines()

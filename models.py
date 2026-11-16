@@ -5,6 +5,7 @@ The figures that matter are the ones it returns after issuing, since it
 resolves prices and tax rates itself.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -88,9 +89,14 @@ class PaymentSlot:
     reference: str = ""
     bank_code: str = ""
     instrument: str = ""
+    # Paid in the reference currency (igtfconfig), the slot's "En divisas"
+    # switch. The amount is still in bolivares. Only these slots bear IGTF.
+    foreign_currency: bool = False
 
     def to_json(self) -> dict:
         slot = {"amount": float(self.amount)}
+        if self.foreign_currency:
+            slot["foreign"] = True
         if self.reference:
             slot["reference"] = self.reference
         if self.bank_code:
@@ -113,6 +119,10 @@ class Invoice:
     global_discount_rate: Decimal = Decimal(0)
     financed: Decimal = Decimal(0)
     credit_days: int = 0
+    # True when any slot is paid in divisas; kept in step with the slots
+    # (sync_foreign_currency). An invoice saved by an older build has it
+    # set without marking any slot: then the whole payment counts as in
+    # divisas, as it did then.
     foreign_currency: bool = False
     igtf_rate: Decimal = Decimal(3)
     uses_igtf: bool = False
@@ -120,6 +130,26 @@ class Invoice:
     reference_label: str = ""
     lines: list[InvoiceLine] = field(default_factory=list)
     payments: list[PaymentSlot] = field(default_factory=list)
+
+    # Payments the totals are worked out for instead of `payments`, while
+    # the payment screen previews them (see previewing). Not a field: never
+    # stored.
+    _preview = None
+
+    # ---------------------------------------------------------- previewing
+
+    def _currency_slots(self) -> list["PaymentSlot"]:
+        return self._preview if self._preview is not None else self.payments
+
+    @contextmanager
+    def previewing(self, payments: list["PaymentSlot"]):
+        """Works out IGTF and the totals as if paid with `payments`."""
+        previous = self._preview
+        self._preview = payments
+        try:
+            yield self
+        finally:
+            self._preview = previous
 
     # ------------------------------------------------------------- totals
 
@@ -169,28 +199,28 @@ class Invoice:
             else:
                 share = money(total * line.net / base)
                 allocated += share
-            yield line, share
+            yield line, share, line.net
 
     @property
     def taxable_base(self) -> Decimal:
         """Net base of the non-exempt lines: dcheader.BASEIMPONIBLEIVA."""
-        return sum((line.net - share
-                    for line, share in self._line_shares()
+        return sum((net - share
+                    for line, share, net in self._line_shares()
                     if not line.exempt), Decimal("0.00"))
 
     @property
     def exempt_base(self) -> Decimal:
         """Net base of the exempt lines: dcheader.TOTALEXENTAS."""
-        return sum((line.net - share
-                    for line, share in self._line_shares()
+        return sum((net - share
+                    for line, share, net in self._line_shares()
                     if line.exempt), Decimal("0.00"))
 
     @property
     def tax(self) -> Decimal:
         total = Decimal("0.00")
-        for line, share in self._line_shares():
+        for line, share, net in self._line_shares():
             if not line.exempt:
-                total += money((line.net - share) * line.tax_rate / 100)
+                total += money((net - share) * line.tax_rate / 100)
         return total
 
     def tax_breakdown(self) -> list[tuple[Decimal, Decimal, Decimal]]:
@@ -205,10 +235,10 @@ class Invoice:
         """
         bases: dict[Decimal, Decimal] = {}
         taxes: dict[Decimal, Decimal] = {}
-        for line, share in self._line_shares():
+        for line, share, net in self._line_shares():
             if line.exempt:
                 continue
-            base = line.net - share
+            base = net - share
             bases[line.tax_rate] = bases.get(
                 line.tax_rate, Decimal("0.00")) + base
             taxes[line.tax_rate] = taxes.get(
@@ -216,14 +246,68 @@ class Invoice:
 
         return [(rate, bases[rate], taxes[rate]) for rate in sorted(bases)]
 
+    def igtf_base_for(self, payments: list["PaymentSlot"]) -> Decimal:
+        """What is paid in divisas, IGTF aside, which IGTF is charged on,
+        for the given slots: the total (subtotal + IVA) less what is paid in
+        bolivares. IVA does not matter. The same rule as the server
+        (services.invoice, IGTFBase) and the DLL.
+
+        Subtotal 11111.10 and IVA 1777.78: all in divisas, 12888.88 (IGTF
+        386.67); with 6444.44 in bolivares, 6444.44 (IGTF 193.33). IGTF is
+        settled at the till, so it does not apply while any part of the
+        invoice is financed.
+        """
+        with self.previewing(payments):
+            return self._igtf_base()
+
+    def _igtf_base(self) -> Decimal:
+        used = [p for p in self._currency_slots() if p.amount > 0]
+        if used:
+            foreign = any(p.foreign_currency for p in used)
+            local = sum((p.amount for p in used if not p.foreign_currency),
+                        Decimal(0))
+        else:
+            # No slot filled: the server takes it all as cash, in divisas
+            # only for an invoice saved by an older build (see
+            # foreign_currency).
+            foreign = self.foreign_currency
+            local = Decimal(0)
+        if self.financed > 0 or not foreign or not self.uses_igtf:
+            return Decimal("0.00")
+        before = self.subtotal + self.tax
+        if before <= 0:
+            return Decimal("0.00")
+        return money(min(max(before - local, Decimal(0)), before))
+
+    def igtf_for(self, payments: list["PaymentSlot"]) -> Decimal:
+        return money(self.igtf_base_for(payments) * self.igtf_rate / 100)
+
+    def total_for(self, payments: list["PaymentSlot"]) -> Decimal:
+        """The total if the invoice were paid with these slots: the payment
+        screen previews it before saving them."""
+        with self.previewing(payments):
+            return money(self.subtotal + self.tax + self.igtf)
+
+    @property
+    def igtf_base(self) -> Decimal:
+        return self._igtf_base()
+
     @property
     def igtf(self) -> Decimal:
-        # IGTF is settled at the till, so it does not apply while any part
-        # of the invoice is financed.
-        if (self.financed > 0 or not self.foreign_currency
-                or not self.uses_igtf):
-            return Decimal("0.00")
-        return money((self.subtotal + self.tax) * self.igtf_rate / 100)
+        return money(self._igtf_base() * self.igtf_rate / 100)
+
+    def sync_foreign_currency(self) -> None:
+        """foreign_currency follows the slots once they are entered."""
+        self.foreign_currency = any(
+            p.foreign_currency for p in self.payments if p.amount > 0)
+
+    def mark_legacy_foreign(self) -> None:
+        """An invoice saved by a build without the per-slot switch: every
+        slot counts as paid in divisas, as the whole payment did then."""
+        if self.foreign_currency and not any(
+                p.foreign_currency for p in self.payments):
+            for p in self.payments:
+                p.foreign_currency = True
 
     @property
     def total(self) -> Decimal:
@@ -292,9 +376,12 @@ class Invoice:
             payload["financed"] = float(self.financed)
             if self.credit_days > 0:
                 payload["creditDays"] = self.credit_days
-        if self.foreign_currency:
-            payload["foreignCurrency"] = True
         used = [p for p in self.payments if p.amount > 0]
+        # Each slot says its own currency ("foreign" in "payment"). This
+        # flag is for a server older than that, which only knew one switch.
+        if any(p.foreign_currency for p in used) or (
+                not used and self.foreign_currency):
+            payload["foreignCurrency"] = True
         if used:
             payload["payment"] = {p.key: p.to_json() for p in used}
         if offline_since:
@@ -321,5 +408,6 @@ class Invoice:
         self.global_discount_rate = other.global_discount_rate
         self.financed = other.financed
         self.credit_days = other.credit_days
-        self.foreign_currency = other.foreign_currency
+        # Follows the payments, which are entered again.
+        self.foreign_currency = False
         self.lines = list(other.lines)

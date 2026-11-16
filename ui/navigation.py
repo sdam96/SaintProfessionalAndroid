@@ -1,10 +1,3 @@
-"""Navigation over the page view stack.
-
-1.0 keeps page.views as the editable stack. Both moving forward and going
-back are done by adjusting page.views and then routing to whatever view is
-on top with the awaitable page.push_route; there is no pop_route.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -20,8 +13,6 @@ if TYPE_CHECKING:
 class Navigator:
     def __init__(self, page: ft.Page):
         self._page = page
-        # Set once the session exists; every pushed screen then carries the
-        # connection banner and an app bar that turns orange offline.
         self.indicator: ConnectionIndicator | None = None
 
     async def _route_to_top(self) -> None:
@@ -36,9 +27,6 @@ class Navigator:
                                     icon_color=ft.Colors.WHITE,
                                     on_click=self.back)
 
-        # A screen that scrolls as a whole gets the closing allowance, so its
-        # last button can always be scrolled above the navigation bar.
-        # Screens with their own inner scroll add it themselves.
         if isinstance(body, ft.Column) and body.scroll:
             body.controls.append(bottom_allowance())
 
@@ -46,10 +34,9 @@ class Navigator:
             title=ft.Text(title, weight=ft.FontWeight.W_500),
             bgcolor=PRIMARY, color=ft.Colors.WHITE, elevation=2,
             leading=leading,
+            automatically_imply_leading=show_back,
         )
-        # Keeps the last control of every screen (usually its main button)
-        # above the system navigation bar, which an edge-to-edge Android
-        # draws over the app.
+ 
         content: list[ft.Control] = [ft.SafeArea(
             expand=True,
             content=ft.Container(expand=True, padding=16, content=body))]
@@ -64,6 +51,7 @@ class Navigator:
             padding=0,
             spacing=0,
             controls=content,
+            can_pop=show_back,
         )
         self._page.views.append(view)
         await self._page.push_route(route)

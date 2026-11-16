@@ -3,6 +3,10 @@
 The five instruments are the five slots of Saint's payment window and keep
 its names. They are not all shown up front: the user adds the ones the
 customer pays with, each at most once, and can remove them again.
+
+Each instrument has its own "En divisas" switch. Amounts are always typed
+in bolivares; the switch says the customer paid that part in dollars, and
+only that part bears IGTF (models.Invoice.igtf_base_for).
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ _OTHER_SLOTS = ("other1", "other2")
 @dataclass
 class _SlotFields:
     amount: ft.TextField
+    foreign: ft.Switch                     # "En divisas"
+    equivalent: ft.Text                    # the amount in dollars
     reference: ft.TextField | None = None
     bank: ft.Dropdown | None = None        # from bancos
     instrument: ft.Dropdown | None = None  # "Tipo", from cfinstru
@@ -225,10 +231,20 @@ class TotaliseView:
                                f"{existing.amount}" if existing else "")
         amount.on_focus = lambda e: self._on_slot_focus(key)
         amount.on_change = self._recompute
+        foreign = ft.Switch(
+            label="En divisas", active_color=ACCENT,
+            value=existing.foreign_currency if existing else False,
+            on_change=lambda e: self._on_foreign_change(key))
+        equivalent = ft.Text("", size=12, color=ACCENT)
+        currency_row = ft.Row(
+            spacing=12, wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[foreign, equivalent])
 
         if key in _AMOUNT_ONLY_SLOTS:
-            self._slots[key] = _SlotFields(amount)
-            body = fields(amount)
+            self._slots[key] = _SlotFields(amount, foreign, equivalent)
+            body = ft.Column(spacing=8, controls=[fields(amount),
+                                                  currency_row])
         else:
             reference = ft.TextField(
                 label="Número", width=FIELD_MED, border=rounded_border(10),
@@ -245,9 +261,10 @@ class TotaliseView:
                 self._initial_bank[key] = existing.bank_code
             if existing and existing.instrument:
                 self._initial_type[key] = existing.instrument
-            self._slots[key] = _SlotFields(amount, reference, bank,
-                                           instrument)
-            body = fields(amount, reference, instrument, bank)
+            self._slots[key] = _SlotFields(amount, foreign, equivalent,
+                                           reference, bank, instrument)
+            body = ft.Column(spacing=8, controls=[
+                fields(amount, reference, instrument, bank), currency_row])
             self._apply_options(key)
 
         card = ft.Card(elevation=1, content=ft.Container(
@@ -373,21 +390,61 @@ class TotaliseView:
             return Decimal(0)
         return to_decimal(self._financed.value)
 
-    def _preview_total(self) -> Decimal:
-        """The total under the discount and financing typed in here."""
+    def _screen_slots(self, skip_key: str = "",
+                      foreign_override: dict[str, bool] | None = None
+                      ) -> list[PaymentSlot]:
+        """The amounts and currencies on screen, unchecked: what the IGTF
+        preview is computed from before anything is saved."""
+        override = foreign_override or {}
+        return [PaymentSlot(key=key, label="",
+                            amount=to_decimal(slot.amount.value),
+                            foreign_currency=override.get(
+                                key, bool(slot.foreign.value)))
+                for key, slot in self._slots.items() if key != skip_key]
+
+    def _preview_total(self, slots: list[PaymentSlot] | None = None
+                       ) -> Decimal:
+        """The total under the discount, financing and payments typed in
+        here: IGTF depends on what is paid in divisas."""
         self._invoice.global_discount_rate = to_decimal(
             self._global_discount.value)
         self._invoice.financed = self._financed_value()
-        return self._invoice.total
+        return self._invoice.total_for(
+            self._screen_slots() if slots is None else slots)
+
+    def _preview_payable(self, slots: list[PaymentSlot] | None = None
+                         ) -> Decimal:
+        return self._preview_total(slots) - self._invoice.financed
 
     def _slots_total(self, skip_key: str = "") -> Decimal:
         return sum((to_decimal(slot.amount.value)
                     for key, slot in self._slots.items() if key != skip_key),
                    Decimal(0))
 
+    def _refresh_equivalents(self) -> None:
+        """Each amount paid in divisas, in dollars at the reference rate."""
+        rate = self._invoice.reference_rate
+        for slot in self._slots.values():
+            value = to_decimal(slot.amount.value)
+            if slot.foreign.value and rate > 0 and value > 0:
+                slot.equivalent.value = (
+                    f"{value / rate:,.2f} {self._invoice.reference_label}"
+                    .strip())
+            else:
+                slot.equivalent.value = ""
+
     def _refresh_breakdown(self) -> None:
-        total = self._preview_total()
+        slots = self._screen_slots()
+        # IGTF and the totals follow the slots on screen.
+        with self._invoice.previewing(slots):
+            self._build_breakdown(slots)
+        self._refresh_equivalents()
+
+    def _build_breakdown(self, slots: list[PaymentSlot]) -> None:
+        total = self._preview_total(slots)
         invoice = self._invoice
+        igtf_base = invoice.igtf_base_for(slots)
+        igtf = invoice.igtf_for(slots)
         controls: list[ft.Control] = [
             _money_row("Bruto", invoice.gross),
             _money_row("Descuento renglones", invoice.line_discount),
@@ -396,18 +453,19 @@ class TotaliseView:
             _money_row("Subtotal", invoice.subtotal),
         ]
         controls += self._tax_rows(invoice)
-        if invoice.igtf > 0:
-            controls.append(_money_row("IGTF", invoice.igtf))
+        if igtf > 0:
+            controls.append(_money_row(
+                f"IGTF {invoice.igtf_rate:g}% sobre {igtf_base:,.2f}", igtf))
         controls += [
             ft.Divider(height=6),
             _money_row("TOTAL", total, bold=True),
             _money_row("A financiar", invoice.financed,
                        colour=ft.Colors.ORANGE_800),
-            _money_row("A cobrar", invoice.payable, bold=True,
+            _money_row("A cobrar", total - invoice.financed, bold=True,
                        colour=ft.Colors.GREEN_700),
         ]
         if invoice.reference_rate > 0:
-            controls += self._reference_rows()
+            controls += self._reference_rows(total)
         self._breakdown.controls = controls
 
     def _tax_rows(self, invoice) -> list[ft.Control]:
@@ -425,14 +483,14 @@ class TotaliseView:
             rows.append(_money_row(f"    IVA {rate:g}% sobre {base:,.2f}", tax))
         return rows
 
-    def _reference_rows(self) -> list[ft.Control]:
+    def _reference_rows(self, total: Decimal) -> list[ft.Control]:
         invoice = self._invoice
         return [
             ft.Divider(height=6),
             ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
                 ft.Text(f"Equivalente en {invoice.reference_label}",
                         size=12, color=ACCENT),
-                ft.Text(f"{invoice.total_in_reference:,.2f}", size=13,
+                ft.Text(f"{total / invoice.reference_rate:,.2f}", size=13,
                         color=ACCENT, weight=ft.FontWeight.BOLD),
             ]),
             ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
@@ -457,7 +515,7 @@ class TotaliseView:
 
     def _recompute(self, e=None) -> None:
         self._refresh_breakdown()
-        payable = self._invoice.payable
+        payable = self._preview_payable()
         assigned = self._slots_total()
         pending = payable - assigned
         if assigned == 0:
@@ -488,11 +546,49 @@ class TotaliseView:
         slot = self._slots.get(key)
         if slot is None or to_decimal(slot.amount.value) > 0:
             return
-        self._preview_total()
-        pending = self._invoice.payable - self._slots_total(skip_key=key)
+        pending = self._pending_for(key, bool(slot.foreign.value))
         if pending > 0:
             slot.amount.value = f"{pending:.2f}"
             self._recompute()
+
+    def _pending_for(self, key: str, foreign: bool) -> Decimal:
+        """What slot `key` must take to settle the invoice, paid in divisas
+        or not: the IGTF it brings counts."""
+        others = self._screen_slots(skip_key=key)
+        assigned = self._slots_total(skip_key=key)
+
+        def remainder(amount: Decimal) -> Decimal:
+            probe = PaymentSlot(key=key, label="", amount=amount,
+                                foreign_currency=foreign)
+            return self._preview_payable(others + [probe]) - assigned
+
+        if foreign:
+            # Paid in divisas, its amount does not change the IGTF: a cent
+            # stands in for it.
+            return remainder(Decimal("0.01"))
+        # Paid in bolivares, its amount lowers the IGTF of the other slots,
+        # which lowers what is left for it: settle by repeating. Each round
+        # moves by about 3% of the last one, so a few rounds reach the cent.
+        amount = remainder(Decimal(0))
+        for _ in range(10):
+            following = remainder(amount)
+            if following == amount:
+                break
+            amount = following
+        return amount
+
+    def _on_foreign_change(self, key: str) -> None:
+        """A slot that took the whole balance keeps doing so when its
+        currency changes, since IGTF comes or goes with it."""
+        slot = self._slots.get(key)
+        if slot is not None:
+            now = bool(slot.foreign.value)
+            value = to_decimal(slot.amount.value)
+            if value > 0 and value == self._pending_for(key, not now):
+                pending = self._pending_for(key, now)
+                if pending > 0:
+                    slot.amount.value = f"{pending:.2f}"
+        self._recompute()
 
     def _on_financed_focus(self, e) -> None:
         """Propose as financed whatever the instruments leave unassigned."""
@@ -502,7 +598,8 @@ class TotaliseView:
         invoice.global_discount_rate = to_decimal(self._global_discount.value)
         # Once anything is financed IGTF stops applying, so the reference
         # total is subtotal + tax, without IGTF.
-        total = invoice.subtotal + invoice.tax
+        with invoice.previewing(self._screen_slots()):
+            total = invoice.subtotal + invoice.tax
         pending = total - self._slots_total()
         if pending > 0:
             self._financed.value = f"{pending:.2f}"
@@ -540,7 +637,17 @@ class TotaliseView:
                 if slot_fields.reference is not None else "",
                 bank_code=bank,
                 instrument=instrument,
+                foreign_currency=bool(slot_fields.foreign.value),
             ))
+
+        # The digital invoice sends both "other" slots in one field, with
+        # one rate: the server rejects them in different currencies.
+        others = [s for s in slots if s.key in _OTHER_SLOTS]
+        if len(others) == 2 and (others[0].foreign_currency
+                                 != others[1].foreign_currency):
+            self._fail("Otro instrumento 1 y 2 deben pagarse en la misma "
+                       "moneda.")
+            return None
         return slots
 
     async def _save(self, e) -> None:
@@ -555,12 +662,13 @@ class TotaliseView:
         invoice.credit_days = (int(to_decimal(self._credit_days.value))
                                if self._allows_credit else 0)
 
-        if invoice.financed > invoice.total:
-            self._fail("Lo financiado excede el total.")
-            return
-
         slots = self._collect_slots()
         if slots is None:
+            return
+
+        total = invoice.total_for(slots)
+        if invoice.financed > total:
+            self._fail("Lo financiado excede el total.")
             return
 
         if not self._allows_credit and not slots:
@@ -569,10 +677,11 @@ class TotaliseView:
             return
 
         assigned = sum((s.amount for s in slots), Decimal(0))
-        if slots and assigned != invoice.payable:
+        if slots and assigned != total - invoice.financed:
             self._fail("El desglose no coincide con lo que se cobra.")
             return
 
         invoice.payments = slots
+        invoice.sync_foreign_currency()
         self._on_saved()
         await self._ctx.navigator.back()
