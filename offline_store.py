@@ -40,7 +40,9 @@ from models import Invoice, InvoiceLine, PaymentSlot
 
 DB_FILE = "saintpro_offline.db"
 # 3: pending_invoice_payments.foreign_currency (the per-slot "En divisas").
-SCHEMA_VERSION = 3
+# 4: discount amounts (pending_invoices.global_discount_amount,
+#    pending_invoice_lines.discount_amount).
+SCHEMA_VERSION = 4
 
 # pending_invoices.status
 PENDING = "pending"   # waiting to be sent
@@ -160,6 +162,7 @@ CREATE TABLE pending_invoices (
     user                 TEXT    NOT NULL,
     cash_register        TEXT    NOT NULL,
     global_discount_rate TEXT    NOT NULL,
+    global_discount_amount TEXT  NOT NULL DEFAULT '0',
     financed             TEXT    NOT NULL,
     credit_days          INTEGER NOT NULL,
     foreign_currency     INTEGER NOT NULL CHECK (foreign_currency IN (0, 1)),
@@ -186,6 +189,7 @@ CREATE TABLE pending_invoice_lines (
     discount_rate TEXT    NOT NULL,
     warehouse     TEXT    NOT NULL,
     list_price    TEXT    NOT NULL,
+    discount_amount TEXT  NOT NULL DEFAULT '0',
     PRIMARY KEY (invoice_id, line_no)
 );
 
@@ -322,15 +326,26 @@ class OfflineStore:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
-        if version == 2:
-            # Only a column is added: the invoices waiting to be sent must
-            # survive the update. Their slots start in bolivares;
-            # Invoice.mark_legacy_foreign restores what the old switch said.
+        if version in (2, 3):
+            # Only columns are added: the invoices waiting to be sent must
+            # survive the update.
             with self._db:
+                if version == 2:
+                    # Their slots start in bolivares;
+                    # Invoice.mark_legacy_foreign restores what the old
+                    # switch said.
+                    self._db.execute(
+                        "ALTER TABLE pending_invoice_payments ADD COLUMN "
+                        "foreign_currency INTEGER NOT NULL DEFAULT 0 "
+                        "CHECK (foreign_currency IN (0, 1))")
+                # Discount amounts. Invoices saved before keep their
+                # percentages (discount_rate, global_discount_rate).
                 self._db.execute(
-                    "ALTER TABLE pending_invoice_payments ADD COLUMN "
-                    "foreign_currency INTEGER NOT NULL DEFAULT 0 "
-                    "CHECK (foreign_currency IN (0, 1))")
+                    "ALTER TABLE pending_invoices ADD COLUMN "
+                    "global_discount_amount TEXT NOT NULL DEFAULT '0'")
+                self._db.execute(
+                    "ALTER TABLE pending_invoice_lines ADD COLUMN "
+                    "discount_amount TEXT NOT NULL DEFAULT '0'")
                 self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
         with self._db:

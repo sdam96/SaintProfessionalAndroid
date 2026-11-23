@@ -33,6 +33,8 @@ class InvoiceLine:
     unit_price: Decimal
     tax_rate: Decimal
     exempt: bool
+    # Legacy: a percentage, from an invoice saved before discounts became
+    # amounts. New lines carry discount_amount.
     discount_rate: Decimal = Decimal(0)
     warehouse: str = "01"
     # One serial per unit when the product is serialised. Saint deletes the
@@ -42,6 +44,8 @@ class InvoiceLine:
     # Sent only for an invoice made offline: if the server's price differs
     # by then, it holds the invoice for review instead of issuing it.
     list_price: Decimal = Decimal(0)
+    # Amount off the line, in bolivares. Discounts are always amounts.
+    discount_amount: Decimal = Decimal(0)
 
     @property
     def gross(self) -> Decimal:
@@ -49,6 +53,8 @@ class InvoiceLine:
 
     @property
     def discount(self) -> Decimal:
+        if self.discount_amount > 0:
+            return money(self.discount_amount)
         if self.discount_rate <= 0:
             return Decimal("0.00")
         return money(self.gross * self.discount_rate / 100)
@@ -66,7 +72,9 @@ class InvoiceLine:
         }
         if self.unit_price > 0:
             line["price"] = float(self.unit_price)
-        if self.discount_rate > 0:
+        if self.discount_amount > 0:
+            line["discountAmount"] = float(self.discount_amount)
+        elif self.discount_rate > 0:
             line["discount"] = float(self.discount_rate)
         if self.serials:
             line["serials"] = list(self.serials)
@@ -116,7 +124,12 @@ class Invoice:
     warehouse: str = "01"
     user: str = "DEMO"
     cash_register: str = "DEMO"
+    # Legacy: a percentage, from an invoice saved before discounts became
+    # amounts. New invoices carry global_discount_amount.
     global_discount_rate: Decimal = Decimal(0)
+    # Amount off the whole invoice, in bolivares. The server works out the
+    # percentage Saint stores beside it (200 off 1011.11 is 19.78).
+    global_discount_amount: Decimal = Decimal(0)
     financed: Decimal = Decimal(0)
     credit_days: int = 0
     # True when any slot is paid in divisas; kept in step with the slots
@@ -168,6 +181,8 @@ class Invoice:
 
     @property
     def global_discount(self) -> Decimal:
+        if self.global_discount_amount > 0:
+            return money(self.global_discount_amount)
         if self.global_discount_rate <= 0:
             return Decimal("0.00")
         return money(self.global_discount_base * self.global_discount_rate / 100)
@@ -341,6 +356,7 @@ class Invoice:
         self.customer_code = ""
         self.customer_name = ""
         self.global_discount_rate = Decimal(0)
+        self.global_discount_amount = Decimal(0)
         self.financed = Decimal(0)
         self.credit_days = 0
         self.foreign_currency = False
@@ -370,7 +386,9 @@ class Invoice:
             "cashRegister": self.cash_register,
             "lines": [l.to_json(bool(offline_since)) for l in self.lines],
         }
-        if self.global_discount_rate > 0:
+        if self.global_discount_amount > 0:
+            payload["globalDiscountAmount"] = float(self.global_discount_amount)
+        elif self.global_discount_rate > 0:
             payload["globalDiscount"] = float(self.global_discount_rate)
         if self.financed > 0:
             payload["financed"] = float(self.financed)
@@ -406,6 +424,7 @@ class Invoice:
         self.price_list = other.price_list
         self.warehouse = other.warehouse
         self.global_discount_rate = other.global_discount_rate
+        self.global_discount_amount = other.global_discount_amount
         self.financed = other.financed
         self.credit_days = other.credit_days
         # Follows the payments, which are entered again.

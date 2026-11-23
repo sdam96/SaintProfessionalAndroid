@@ -153,7 +153,9 @@ def _customer(invoice: Invoice) -> ft.Column:
 
 def _line(line) -> ft.Column:
     detail = f"{_quantity(line.quantity)} × {line.unit_price:,.2f}"
-    if line.discount_rate > 0:
+    if line.discount_amount > 0:
+        detail += f" · desc. {line.discount_amount:,.2f}"
+    elif line.discount_rate > 0:
         detail += f" · desc. {_rate(line.discount_rate)}%"
     detail += " · exento" if line.exempt else f" · IVA {_rate(line.tax_rate)}%"
     return ft.Column(spacing=0, controls=[

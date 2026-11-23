@@ -19,7 +19,7 @@ from decimal import Decimal
 import flet as ft
 
 from api_client import ApiError
-from models import PaymentSlot
+from models import PaymentSlot, money
 
 from ..context import AppContext
 from ..theme import (ACCENT, DANGER, FIELD_MED, FIELD_NARROW,
@@ -101,10 +101,11 @@ class TotaliseView:
         self._allows_credit = allows_credit
         invoice = self._invoice
 
+        # Discounts are always amounts, in bolivares.
         self._global_discount = _number_field(
-            "Descuento global %",
-            f"{invoice.global_discount_rate:g}"
-            if invoice.global_discount_rate else "")
+            "Descuento global",
+            f"{invoice.global_discount:.2f}"
+            if invoice.global_discount else "")
         self._financed = _number_field(
             "Monto a financiar",
             f"{invoice.financed}"
@@ -406,8 +407,7 @@ class TotaliseView:
                        ) -> Decimal:
         """The total under the discount, financing and payments typed in
         here: IGTF depends on what is paid in divisas."""
-        self._invoice.global_discount_rate = to_decimal(
-            self._global_discount.value)
+        self._set_global_discount(to_decimal(self._global_discount.value))
         self._invoice.financed = self._financed_value()
         return self._invoice.total_for(
             self._screen_slots() if slots is None else slots)
@@ -590,12 +590,18 @@ class TotaliseView:
                     slot.amount.value = f"{pending:.2f}"
         self._recompute()
 
+    def _set_global_discount(self, amount: Decimal) -> None:
+        """The global discount as typed, an amount: it replaces a
+        percentage left by an invoice saved before amounts."""
+        self._invoice.global_discount_amount = money(max(amount, Decimal(0)))
+        self._invoice.global_discount_rate = Decimal(0)
+
     def _on_financed_focus(self, e) -> None:
         """Propose as financed whatever the instruments leave unassigned."""
         if not self._allows_credit or to_decimal(self._financed.value) > 0:
             return
         invoice = self._invoice
-        invoice.global_discount_rate = to_decimal(self._global_discount.value)
+        self._set_global_discount(to_decimal(self._global_discount.value))
         # Once anything is financed IGTF stops applying, so the reference
         # total is subtotal + tax, without IGTF.
         with invoice.previewing(self._screen_slots()):
@@ -652,12 +658,16 @@ class TotaliseView:
 
     async def _save(self, e) -> None:
         invoice = self._invoice
-        rate = to_decimal(self._global_discount.value)
-        if rate < 0 or rate > 100:
-            self._fail("El descuento global debe estar entre 0 y 100.")
+        amount = to_decimal(self._global_discount.value)
+        if amount < 0:
+            self._fail("El descuento global no puede ser negativo.")
+            return
+        if amount > invoice.global_discount_base:
+            self._fail("El descuento global no puede ser mayor que el monto "
+                       "de la factura.")
             return
 
-        invoice.global_discount_rate = rate
+        self._set_global_discount(amount)
         invoice.financed = self._financed_value()
         invoice.credit_days = (int(to_decimal(self._credit_days.value))
                                if self._allows_credit else 0)

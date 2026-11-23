@@ -50,7 +50,9 @@ def _line_card(index: int, line: InvoiceLine,
                compact: bool = False) -> ft.Card:
     """One invoice line. `compact` trims sizes for a phone-width list."""
     detail = f"{line.quantity:g} × {line.unit_price:,.2f}"
-    if line.discount_rate > 0:
+    if line.discount_amount > 0:
+        detail += f"   −{line.discount_amount:,.2f}"
+    elif line.discount_rate > 0:
         detail += f"   −{line.discount_rate:g}%"
 
     tags = []
